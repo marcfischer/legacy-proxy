@@ -94,7 +94,12 @@ const RESOURCE_LIST_TTL_MS = 15_000;
 const vcardCache = new Map<string, string>();
 const VCARD_CACHE_MAX = 5_000;
 
-function rememberVCard(key: string, data: string): void {
+// Also holds CalDAV iCalendar bodies (their keys carry the "|cal" identity).
+export function cachedBody(key: string): string | undefined {
+  return vcardCache.get(key);
+}
+
+export function rememberVCard(key: string, data: string): void {
   // Re-insert so a re-read moves the entry to the young end.
   vcardCache.delete(key);
   vcardCache.set(key, data);
@@ -123,7 +128,7 @@ export function resetCardDavCaches(): void {
   vcardCache.clear();
 }
 
-function freshEntry<T extends { at: number }>(entry: T | undefined, ttl: number): T | null {
+export function freshEntry<T extends { at: number }>(entry: T | undefined, ttl: number): T | null {
   if (!entry) return null;
   if (Date.now() - entry.at >= ttl) return null;
   return entry;
@@ -134,7 +139,7 @@ export class CardDavClient {
   private readonly origin: string;
   private readonly authHeader: string;
   /** Cache identity: same server, same user => same discovery + book list. */
-  private readonly cacheKey: string;
+  protected readonly cacheKey: string;
 
   constructor(opts: CardDavOpts) {
     this.opts = opts;

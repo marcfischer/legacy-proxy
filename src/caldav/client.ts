@@ -2,7 +2,10 @@
 // the CardDAV client's (same WebDAV underneath); this adds the calendar
 // collection listing and the two REPORTs JMAP for Calendars needs.
 
-import { CardDavClient, extractHref, hasResourceType, splitResponses, textOf, type CardDavOpts } from "../carddav/client.js";
+import {
+  CardDavClient, cachedBody, extractHref, freshEntry, hasResourceType, rememberVCard, splitResponses, textOf, type CardDavOpts,
+} from "../carddav/client.js";
+import { mapWithConcurrency } from "../util/concurrency.js";
 
 export interface CalendarInfo {
   href: string;
@@ -20,12 +23,31 @@ export interface ICalResource {
 
 const CAL_NS = `xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav"`;
 
+// Same caching scheme as the CardDAV client. A calendar load is one
+// Calendar/get plus a query and several CalendarEvent/get batches, each of
+// which needs the calendar list - cache it briefly. Event bodies are keyed by
+// etag in the shared body cache; the etags come from the most recent query,
+// so a body is never older than that query (bounded by ETAG_TTL_MS).
+const calListCache = new Map<string, { cals: CalendarInfo[]; at: number }>();
+const etagCache = new Map<string, { etag: string; at: number }>();
+const CAL_LIST_TTL_MS = 15_000;
+const ETAG_TTL_MS = 60_000;
+const MULTIGET_CHUNK = 100;
+const MULTIGET_CONCURRENCY = 4;
+
+export function resetCalDavCaches(): void {
+  calListCache.clear();
+  etagCache.clear();
+}
+
 export class CalDavClient extends CardDavClient {
   constructor(opts: Omit<CardDavOpts, "caldav">) {
     super({ ...opts, caldav: true });
   }
 
   async listCalendars(): Promise<CalendarInfo[]> {
+    const cached = freshEntry(calListCache.get(this.cacheKey), CAL_LIST_TTL_MS);
+    if (cached) return cached.cals;
     const home = await this.addressBookHome(); // calendar-home-set in caldav mode
     const xml = await this.propfind(home, 1, [
       "DAV:resourcetype",
@@ -49,6 +71,7 @@ export class CalDavClient extends CardDavClient {
         ctag: textOf(r, "getctag") ?? textOf(r, "sync-token"),
       });
     }
+    calListCache.set(this.cacheKey, { cals: out, at: Date.now() });
     return out;
   }
 
@@ -63,11 +86,34 @@ export class CalDavClient extends CardDavClient {
       `<C:filter><C:comp-filter name="VCALENDAR"><C:comp-filter name="VEVENT">${tr}</C:comp-filter></C:comp-filter></C:filter>` +
       `</C:calendar-query>`;
     const xml = await this.request("REPORT", calHref, body, { Depth: "1" });
-    return splitResponses(xml).map(extractHref).filter((h): h is string => !!h && h !== calHref);
+    const out: string[] = [];
+    const now = Date.now();
+    for (const r of splitResponses(xml)) {
+      const href = extractHref(r);
+      if (!href || href === calHref) continue;
+      const etag = textOf(r, "getetag");
+      if (etag) etagCache.set(`${this.cacheKey}|${href}`, { etag, at: now });
+      out.push(href);
+    }
+    return out;
   }
 
   async multiGetEvents(calHref: string, hrefs: string[]): Promise<ICalResource[]> {
-    if (hrefs.length === 0) return [];
+    const out: ICalResource[] = [];
+    const missing: string[] = [];
+    for (const href of hrefs) {
+      const etag = freshEntry(etagCache.get(`${this.cacheKey}|${href}`), ETAG_TTL_MS)?.etag;
+      const data = etag ? cachedBody(`${this.cacheKey}|${href}|${etag}`) : undefined;
+      if (etag && data !== undefined) out.push({ href, etag, data });
+      else missing.push(href);
+    }
+    const chunks: string[][] = [];
+    for (let i = 0; i < missing.length; i += MULTIGET_CHUNK) chunks.push(missing.slice(i, i + MULTIGET_CHUNK));
+    const fetched = await mapWithConcurrency(chunks, MULTIGET_CONCURRENCY, (c) => this.fetchEvents(calHref, c));
+    return out.concat(fetched.flat());
+  }
+
+  private async fetchEvents(calHref: string, hrefs: string[]): Promise<ICalResource[]> {
     const body =
       `<?xml version="1.0" encoding="utf-8"?>\n` +
       `<C:calendar-multiget ${CAL_NS}><D:prop><D:getetag/><C:calendar-data/></D:prop>` +
@@ -78,7 +124,10 @@ export class CalDavClient extends CardDavClient {
     for (const r of splitResponses(xml)) {
       const href = extractHref(r);
       const data = textOf(r, "calendar-data");
-      if (href && data) out.push({ href, etag: textOf(r, "getetag"), data });
+      if (!href || !data) continue;
+      const etag = textOf(r, "getetag");
+      if (etag) rememberVCard(`${this.cacheKey}|${href}|${etag}`, data);
+      out.push({ href, etag, data });
     }
     return out;
   }

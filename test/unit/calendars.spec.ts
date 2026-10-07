@@ -5,6 +5,7 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { calendarEventGet, calendarEventQuery, calendarGet, type CalendarCtx } from "../../src/jmap/methods/calendars.js";
 import { resetCardDavCaches } from "../../src/carddav/client.js";
+import { resetCalDavCaches } from "../../src/caldav/client.js";
 import type { AccountRow } from "../../src/state/store.js";
 import type { ProviderConfig } from "../../src/util/config.js";
 
@@ -16,6 +17,7 @@ let reports: string[] = [];
 
 beforeEach(() => {
   resetCardDavCaches();
+  resetCalDavCaches();
   reports = [];
   vi.stubGlobal("fetch", async (url: string, init: RequestInit) => {
     const auth = (init.headers as Record<string, string>).Authorization;
@@ -61,4 +63,10 @@ it("lists calendars and reads events in a time range with separate DAV credentia
   const got = await calendarEventGet({ accountId: "1", ids: [...q.ids, "bogus"] }, ctx);
   expect(got.list).toMatchObject([{ id: q.ids[0], title: "Lunch & talk", utcStart: "2026-10-07T12:00:00Z", duration: "PT1H" }]);
   expect(got.notFound).toEqual(["bogus"]);
+
+  // A reload within the cache window is served from the etag-keyed body cache.
+  const before = reports.length;
+  const again = await calendarEventGet({ accountId: "1", ids: q.ids }, ctx);
+  expect(again.list).toHaveLength(1);
+  expect(reports.length).toBe(before);
 });
