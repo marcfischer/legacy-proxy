@@ -3,6 +3,7 @@ import type { FetchMessageObject, ImapFlow } from "imapflow";
 // eslint-disable-next-line @typescript-eslint/ban-ts-comment
 // @ts-expect-error no declaration file
 import libqp from "libqp";
+import { simpleParser } from "mailparser";
 import { selectBodies, structureToBodyParts, type EmailBodyPart } from "../mapping/structure.js";
 import { flagsToKeywords } from "../mapping/flags.js";
 import { encodeBlobId, encodeEmailId, encodeMailboxId } from "../mapping/ids.js";
@@ -350,13 +351,75 @@ async function fetchBodyValuesBatched(
         };
       }
       if (missing.length > 0) {
+        const wanted = byUid.get(m.uid)!.wanted;
+        const recovered = await recoverPartsFromSource(client, m.uid, missing.map((id) => wanted.get(id)!), cap);
+        for (const [partId, value] of recovered) values[partId] = value;
         log.warn(
-          { uid: m.uid, partIds: missing, inResponse: bodyParts !== undefined },
+          {
+            uid: m.uid,
+            partIds: missing,
+            // What the server actually answered: part keys with byte counts.
+            response: bodyParts
+              ? [...bodyParts].map(([k, v]) => `${k}:${v?.length ?? "null"}`)
+              : null,
+            recovered: [...recovered.keys()],
+          },
           "IMAP server returned no content for body parts",
         );
       }
       out.set(m.uid, values);
     }
+  }
+  return out;
+}
+
+// Fallback for servers that answer BODY[<part>] with nothing although the
+// BODYSTRUCTURE lists content: fetch the whole message and let mailparser
+// find the text and HTML bodies. Parts are matched by media type, so only a
+// part that is the sole missing one of its type is filled in.
+async function recoverPartsFromSource(
+  client: ImapFlow,
+  uid: number,
+  parts: EmailBodyPart[],
+  cap: number,
+): Promise<Map<string, JmapEmail["bodyValues"][string]>> {
+  const out = new Map<string, JmapEmail["bodyValues"][string]>();
+  let source: Buffer | undefined;
+  try {
+    for await (const msg of fetchByUid(client, [uid], { uid: true, source: true })) {
+      if (msg.uid === uid && msg.source) source = msg.source;
+    }
+  } catch (e) {
+    log.warn({ uid, ...imapErrorDetails(e) }, "full message FETCH failed");
+    return out;
+  }
+  if (!source || source.length === 0) {
+    log.warn({ uid }, "IMAP server returned no content for the full message either");
+    return out;
+  }
+  let parsed;
+  try {
+    parsed = await simpleParser(source);
+  } catch (e) {
+    log.warn({ uid, sourceBytes: source.length, err: (e as Error).message }, "parsing full message failed");
+    return out;
+  }
+  const byType: Record<string, string | undefined> = {
+    "text/plain": parsed.text || undefined,
+    "text/html": typeof parsed.html === "string" ? parsed.html : undefined,
+  };
+  for (const part of parts) {
+    if (!part.partId) continue;
+    const text = byType[part.type];
+    if (text === undefined) continue;
+    if (parts.filter((p) => p.type === part.type).length > 1) continue;
+    const bytes = Buffer.from(text, "utf8");
+    const truncated = bytes.length > cap;
+    out.set(part.partId, {
+      value: truncated ? new TextDecoder().decode(bytes.subarray(0, cap)) : text,
+      isEncodingProblem: false,
+      isTruncated: truncated,
+    });
   }
   return out;
 }
