@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { icalToEvent, localToUtc, utcToLocal } from "../../src/caldav/ical.js";
+import { eventToIcal, icalToEvent, localToUtc, utcToLocal } from "../../src/caldav/ical.js";
 
 const series = [
   "BEGIN:VCALENDAR",
@@ -86,5 +86,19 @@ describe("time zone helpers", () => {
     const t = localToUtc("2026-10-25T12:00:00", "Europe/Berlin");
     expect(new Date(t).toISOString()).toBe("2026-10-25T11:00:00.000Z");
     expect(utcToLocal(Date.parse("2026-07-01T08:00:00Z"), "Europe/Berlin")).toBe("2026-07-01T10:00:00");
+  });
+});
+
+describe("eventToIcal", () => {
+  it("round-trips an event and keeps what it doesn't model", () => {
+    const withExtras = series.replace("SUMMARY:Team\\, weekly\r\n", "SUMMARY:Team\\, weekly\r\nX-OX-REMINDER:keep;me\r\n");
+    const ev = icalToEvent(withExtras, "e1", "c1")!;
+    const out = eventToIcal(ev, withExtras);
+    expect(out).toContain("X-OX-REMINDER:keep;me");
+    expect(out.match(/BEGIN:VTIMEZONE/g)).toHaveLength(1);
+    const again = icalToEvent(out, "e1", "c1")!;
+    for (const k of ["title", "start", "timeZone", "duration", "recurrenceRule", "recurrenceOverrides", "locations", "alerts"]) {
+      expect(again[k], k).toEqual(ev[k]);
+    }
   });
 });

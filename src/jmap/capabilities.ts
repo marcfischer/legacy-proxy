@@ -61,7 +61,8 @@ export function submissionCapabilityProps() {
 }
 
 export function calendarsCapabilityProps() {
-  // CalDAV resources live in exactly one collection; calendar creation is not wired up yet.
+  // CalDAV resources live in exactly one collection. Calendars can't be
+  // created through us yet, only the events in them.
   return { maxCalendarsPerEvent: 1, mayCreateCalendar: false };
 }
 

@@ -1,9 +1,10 @@
-// iCalendar (RFC 5545) -> JSCalendar (RFC 8984) for JMAP for Calendars.
-// Read-only: one CalDAV resource (a master VEVENT plus any RECURRENCE-ID
+// iCalendar (RFC 5545) <-> JSCalendar (RFC 8984) for JMAP for Calendars.
+// One CalDAV resource (a master VEVENT plus any RECURRENCE-ID
 // overrides) becomes one JSCalendar Event. Recurrences are passed through as
 // rules, not expanded - the client expands them itself.
 
-import { parseLine, unescapeValue, unfold, type ParsedLine } from "../carddav/vcard.js";
+import { escapeValue, fold, parseLine, unescapeValue, unfold, type ParsedLine } from "../carddav/vcard.js";
+import { applyPatch } from "../jmap/methods/contacts.js";
 
 interface Component {
   type: string;
@@ -213,8 +214,9 @@ function parseDate(p: ParsedLine | undefined): IcalDate | null {
   if (!m[4]) return { local, tz: null, date: true };
   if (m[7]) return { local, tz: "Etc/UTC", date: false };
   const tzid = p.params.TZID?.[0];
-  // ponytail: non-IANA TZIDs (Outlook's "W. Europe Standard Time") fall back to
-  // floating time; map them via the VTIMEZONE block if such events show up shifted.
+  // A TZID that isn't an IANA name (Outlook's "W. Europe Standard Time") is
+  // treated as floating time. Resolving it would mean evaluating the
+  // resource's VTIMEZONE, which we don't do yet.
   return { local, tz: tzid && validZone(tzid) ? tzid : null, date: false };
 }
 
@@ -293,4 +295,188 @@ function prop(c: Component, name: string): ParsedLine | undefined {
 function text(c: Component, name: string): string | undefined {
   const p = prop(c, name);
   return p ? unescapeValue(p.value) : undefined;
+}
+
+// -- JSCalendar -> iCalendar -------------------------------------------------------
+
+// VEVENT properties eventToIcal writes itself; anything else on an existing
+// master event (X-*, URL, ATTACH, CATEGORIES, ...) is carried over verbatim.
+const MANAGED = new Set([
+  "UID", "DTSTAMP", "DTSTART", "DTEND", "DURATION", "SUMMARY", "DESCRIPTION", "LOCATION", "RRULE",
+  "EXDATE", "RDATE", "RECURRENCE-ID", "STATUS", "TRANSP", "CLASS", "CREATED", "LAST-MODIFIED",
+  "SEQUENCE", "ORGANIZER", "ATTENDEE",
+]);
+
+/**
+ * Serialise a JSCalendar Event as a CalDAV resource. `original` is the stored
+ * iCalendar body on update: its VTIMEZONEs and unmodelled master properties
+ * are kept.
+ */
+export function eventToIcal(ev: JsEvent, original?: string): string {
+  const tz = typeof ev.timeZone === "string" && validZone(ev.timeZone) ? ev.timeZone : null;
+  const allDay = ev.showWithoutTime === true;
+  const lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Bulwark//legacy-proxy//EN", "CALSCALE:GREGORIAN"];
+
+  const keptZones = original ? original.match(/BEGIN:VTIMEZONE[\s\S]*?END:VTIMEZONE\r?\n?/g) ?? [] : [];
+  for (const z of keptZones) lines.push(z.replace(/\r?\n$/, ""));
+  if (tz && !allDay && !isUtc(tz) && !keptZones.some((z) => new RegExp(`^TZID:${escapeRe(tz)}\\s*$`, "m").test(z))) {
+    lines.push(...vtimezone(tz, Number(String(ev.start ?? "").slice(0, 4)) || new Date().getUTCFullYear()));
+  }
+
+  const masterOrig = original
+    ? parseComponents(original).flatMap((c) => c.children).find((c) => c.type === "VEVENT" && !prop(c, "RECURRENCE-ID"))
+    : undefined;
+  const extra = masterOrig ? masterOrig.props.filter((p) => !MANAGED.has(p.name)).map(rawLine) : [];
+
+  const overrides = (ev.recurrenceOverrides ?? {}) as Record<string, Record<string, unknown>>;
+  const exdates = Object.entries(overrides).filter(([, o]) => o.excluded).map(([k]) => dateLine("EXDATE", k, tz, allDay));
+  lines.push(...vevent(ev, tz, allDay, [...(ev.recurrenceRule ? [`RRULE:${rruleString(ev.recurrenceRule as Record<string, unknown>, tz, allDay)}`] : []), ...exdates, ...extra]));
+
+  const base: JsEvent = { ...ev, recurrenceRule: null, recurrenceOverrides: null };
+  for (const [key, patch] of Object.entries(overrides)) {
+    if (patch.excluded) continue;
+    const o = structuredClone(base);
+    applyPatch(o, patch);
+    const oTz = typeof o.timeZone === "string" && validZone(o.timeZone) ? o.timeZone : null;
+    lines.push(...vevent(o, oTz, o.showWithoutTime === true, [], dateLine("RECURRENCE-ID", key, tz, allDay)));
+  }
+  lines.push("END:VCALENDAR");
+  return lines.map(fold).join("\r\n") + "\r\n";
+}
+
+function vevent(e: JsEvent, tz: string | null, allDay: boolean, extra: string[], recurrenceId?: string): string[] {
+  const start = String(e.start ?? "");
+  const out = ["BEGIN:VEVENT", `UID:${e.uid}`, `DTSTAMP:${compactUtc(Date.now())}`];
+  if (recurrenceId) out.push(recurrenceId);
+  out.push(dateLine("DTSTART", start, tz, allDay));
+  out.push(dateLine("DTEND", addSeconds(start, durationSeconds(String(e.duration ?? (allDay ? "P1D" : "PT0S"))), tz, allDay), tz, allDay));
+  if (e.title) out.push(`SUMMARY:${escapeValue(String(e.title))}`);
+  if (e.description) out.push(`DESCRIPTION:${escapeValue(String(e.description))}`);
+  const loc = Object.values((e.locations ?? {}) as Record<string, { name?: string }>).find((l) => l?.name)?.name;
+  if (loc) out.push(`LOCATION:${escapeValue(loc)}`);
+  if (typeof e.status === "string") out.push(`STATUS:${e.status.toUpperCase()}`);
+  out.push(`TRANSP:${e.freeBusyStatus === "free" ? "TRANSPARENT" : "OPAQUE"}`);
+  out.push(`CLASS:${e.privacy === "private" ? "PRIVATE" : e.privacy === "secret" ? "CONFIDENTIAL" : "PUBLIC"}`);
+  out.push(`SEQUENCE:${Number(e.sequence ?? 0) || 0}`);
+  if (typeof e.created === "string") out.push(`CREATED:${compactUtc(Date.parse(e.created))}`);
+  out.push(`LAST-MODIFIED:${compactUtc(Date.now())}`);
+  out.push(...extra);
+
+  for (const p of Object.values((e.participants ?? {}) as Record<string, Record<string, unknown>>)) {
+    const send = (p.sendTo as Record<string, string> | undefined)?.imip;
+    const addr = String(p.email ?? send ?? p.calendarAddress ?? "").replace(/^mailto:/i, "");
+    if (!addr) continue;
+    const cn = p.name ? `;CN=${quoteParam(String(p.name))}` : "";
+    const roles = (p.roles ?? {}) as Record<string, boolean>;
+    if (roles.owner) out.push(`ORGANIZER${cn}:mailto:${addr}`);
+    if (!roles.owner || roles.attendee) {
+      const stat = typeof p.participationStatus === "string" ? p.participationStatus.toUpperCase() : "NEEDS-ACTION";
+      out.push(`ATTENDEE${cn};PARTSTAT=${stat}:mailto:${addr}`);
+    }
+  }
+
+  for (const a of Object.values((e.alerts ?? {}) as Record<string, { trigger?: Record<string, string> }>)) {
+    const t = a?.trigger;
+    if (!t) continue;
+    const trigger = t["@type"] === "AbsoluteTrigger" && t.when
+      ? `TRIGGER;VALUE=DATE-TIME:${compactUtc(Date.parse(t.when))}`
+      : `TRIGGER${t.relativeTo === "end" ? ";RELATED=END" : ""}:${t.offset ?? "PT0S"}`;
+    // EMAIL alarms need ATTENDEE / SUMMARY lines of their own (RFC 5545
+    // §3.6.6), so every alert is written as a DISPLAY alarm.
+    out.push("BEGIN:VALARM", "ACTION:DISPLAY", `DESCRIPTION:${escapeValue(String(e.title || "Reminder"))}`, trigger, "END:VALARM");
+  }
+  out.push("END:VEVENT");
+  return out;
+}
+
+function rruleString(r: Record<string, unknown>, tz: string | null, allDay: boolean): string {
+  const parts = [`FREQ=${String(r.frequency ?? "daily").toUpperCase()}`];
+  if (r.interval && r.interval !== 1) parts.push(`INTERVAL=${r.interval}`);
+  if (r.count) parts.push(`COUNT=${r.count}`);
+  if (typeof r.until === "string") {
+    const until = r.until.slice(0, 19);
+    parts.push(`UNTIL=${allDay ? until.slice(0, 10).replace(/-/g, "") : compactUtc(localToUtc(until, tz ?? "Etc/UTC"))}`);
+  }
+  const days = r.byDay as Array<{ day: string; nthOfPeriod?: number }> | null | undefined;
+  if (days?.length) parts.push(`BYDAY=${days.map((d) => `${d.nthOfPeriod ?? ""}${d.day.toUpperCase()}`).join(",")}`);
+  const lists: Array<[string, string]> = [
+    ["byMonthDay", "BYMONTHDAY"], ["byMonth", "BYMONTH"], ["byYearDay", "BYYEARDAY"], ["byWeekNo", "BYWEEKNO"],
+    ["byHour", "BYHOUR"], ["byMinute", "BYMINUTE"], ["bySecond", "BYSECOND"], ["bySetPosition", "BYSETPOS"],
+  ];
+  for (const [k, name] of lists) {
+    const v = r[k] as unknown[] | null | undefined;
+    if (v?.length) parts.push(`${name}=${v.join(",")}`);
+  }
+  if (typeof r.firstDayOfWeek === "string" && r.firstDayOfWeek !== "mo") parts.push(`WKST=${r.firstDayOfWeek.toUpperCase()}`);
+  return parts.join(";");
+}
+
+function dateLine(name: string, local: string, tz: string | null, allDay: boolean): string {
+  const compact = local.slice(0, 19).replace(/[-:]/g, "");
+  if (allDay) return `${name};VALUE=DATE:${compact.slice(0, 8)}`;
+  if (tz && isUtc(tz)) return `${name}:${compact}Z`;
+  return tz ? `${name};TZID=${tz}:${compact}` : `${name}:${compact}`;
+}
+
+function addSeconds(local: string, secs: number, tz: string | null, allDay: boolean): string {
+  const l = local.slice(0, 19);
+  if (allDay || !tz) return new Date(Date.parse(l + "Z") + secs * 1000).toISOString().slice(0, 19);
+  return utcToLocal(localToUtc(l, tz) + secs * 1000, tz);
+}
+
+/**
+ * Build a VTIMEZONE for `tz` from the platform's zone data, describing the
+ * given year's transitions as yearly "nth / last weekday of the month" rules.
+ * That holds for the EU and US zones; for anything more irregular the block
+ * is only approximate, but it still carries the IANA TZID, which CalDAV
+ * servers resolve on their own.
+ */
+function vtimezone(tz: string, year: number): string[] {
+  const off = (ms: number) => Math.round((Date.parse(utcToLocal(ms, tz) + "Z") - ms) / 60_000);
+  const fmtOff = (m: number) => `${m < 0 ? "-" : "+"}${String(Math.floor(Math.abs(m) / 60)).padStart(2, "0")}${String(Math.abs(m) % 60).padStart(2, "0")}`;
+  const out = ["BEGIN:VTIMEZONE", `TZID:${tz}`];
+  const from = Date.UTC(year, 0, 1), to = Date.UTC(year + 1, 0, 1);
+  let prev = off(from);
+  let found = false;
+  for (let t = from + 3_600_000; t < to; t += 3_600_000) {
+    const o = off(t);
+    if (o === prev) continue;
+    const wall = new Date(t + prev * 60_000);
+    const day = wall.getUTCDate();
+    const dim = new Date(Date.UTC(wall.getUTCFullYear(), wall.getUTCMonth() + 1, 0)).getUTCDate();
+    const nth = day + 7 > dim ? -1 : Math.ceil(day / 7);
+    const wd = ["SU", "MO", "TU", "WE", "TH", "FR", "SA"][wall.getUTCDay()];
+    const kind = o > prev ? "DAYLIGHT" : "STANDARD";
+    out.push(`BEGIN:${kind}`, `DTSTART:${wall.toISOString().slice(0, 19).replace(/[-:]/g, "")}`,
+      `TZOFFSETFROM:${fmtOff(prev)}`, `TZOFFSETTO:${fmtOff(o)}`,
+      `RRULE:FREQ=YEARLY;BYMONTH=${wall.getUTCMonth() + 1};BYDAY=${nth}${wd}`, `END:${kind}`);
+    prev = o;
+    found = true;
+  }
+  if (!found) {
+    out.push("BEGIN:STANDARD", "DTSTART:19700101T000000", `TZOFFSETFROM:${fmtOff(prev)}`, `TZOFFSETTO:${fmtOff(prev)}`, "END:STANDARD");
+  }
+  out.push("END:VTIMEZONE");
+  return out;
+}
+
+function isUtc(tz: string): boolean {
+  return tz === "UTC" || tz === "Etc/UTC";
+}
+
+function compactUtc(ms: number): string {
+  return new Date(ms).toISOString().replace(/[-:]/g, "").replace(/\.\d{3}/, "");
+}
+
+function rawLine(p: ParsedLine): string {
+  const params = Object.entries(p.params).map(([k, vs]) => `;${k}=${vs.map(quoteParam).join(",")}`).join("");
+  return `${p.name}${params}:${p.value}`;
+}
+
+function quoteParam(v: string): string {
+  return /[:;,]/.test(v) ? `"${v.replace(/"/g, "")}"` : v;
+}
+
+function escapeRe(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }

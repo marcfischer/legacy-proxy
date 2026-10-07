@@ -1,12 +1,13 @@
-// JMAP for Calendars handlers backed by CalDAV (RFC 4791). Read-only for now:
-// Calendar/get, CalendarEvent/query, CalendarEvent/get. Ids follow the
+// JMAP for Calendars handlers backed by CalDAV (RFC 4791): Calendar/get and
+// CalendarEvent/get, /query and /set. Ids follow the
 // contacts scheme - base64url of the collection href, and of
 // "collectionHref\nresourceHref" for events.
 
 import crypto from "node:crypto";
 import { Buffer } from "node:buffer";
 import { CalDavClient, type CalendarInfo } from "../../caldav/client.js";
-import { icalToEvent, localToUtc, type JsEvent } from "../../caldav/ical.js";
+import { eventToIcal, icalToEvent, localToUtc, type JsEvent } from "../../caldav/ical.js";
+import { applyPatch, errorFor, setError } from "./contacts.js";
 import { mapWithConcurrency } from "../../util/concurrency.js";
 import type { Credentials } from "../../auth/credentials.js";
 import type { ProviderConfig } from "../../util/config.js";
@@ -19,13 +20,15 @@ export interface CalendarCtx {
   creds: Credentials;
 }
 
-const READ_ONLY_RIGHTS = {
+// Events can be written; the calendars themselves (create, rename, share)
+// cannot yet.
+const RIGHTS = {
   mayReadFreeBusy: true,
   mayReadItems: true,
-  mayWriteAll: false,
-  mayWriteOwn: false,
-  mayUpdatePrivate: false,
-  mayRSVP: false,
+  mayWriteAll: true,
+  mayWriteOwn: true,
+  mayUpdatePrivate: true,
+  mayRSVP: true,
   mayAdmin: false,
   mayDelete: false,
 };
@@ -79,7 +82,7 @@ export async function calendarGet(args: { accountId: string; ids?: string[] | nu
     defaultAlertsWithoutTime: null,
     timeZone: null,
     shareWith: null,
-    myRights: READ_ONLY_RIGHTS,
+    myRights: RIGHTS,
   }));
   const ids = args.ids ?? null;
   return {
@@ -131,7 +134,8 @@ export async function calendarEventQuery(
   ctx: CalendarCtx,
 ) {
   checkAccount(args.accountId, ctx);
-  // ponytail: no sort support, results come in server order; the client sorts.
+  // We don't implement `sort`: ids come back in server order, and Bulwark
+  // sorts the expanded occurrences itself anyway.
   const { ids, state: s } = await queryAll(ctx, args.filter, args.timeZone);
   const position = Math.max(0, args.position ?? 0);
   const limit = args.limit && args.limit > 0 ? args.limit : ids.length;
@@ -180,4 +184,104 @@ export async function calendarEventGet(args: { accountId: string; ids?: string[]
     for (const [href, id] of hrefs) if (!found.has(href)) notFound.push(id);
   });
   return { accountId: args.accountId, state: state(cals), list, notFound };
+}
+
+// -- CalendarEvent/set -------------------------------------------------------------
+
+type SetError = ReturnType<typeof setError>;
+
+// Server-set or derived properties; a client sending them back is ignored
+// rather than rejected.
+const EVENT_READ_ONLY = new Set(["id", "uid", "@type", "created", "updated", "utcStart", "utcEnd", "baseEventId", "isOrigin", "isDraft"]);
+
+export async function calendarEventSet(
+  args: {
+    accountId: string;
+    ifInState?: string | null;
+    create?: Record<string, JsEvent> | null;
+    update?: Record<string, Record<string, unknown>> | null;
+    destroy?: string[] | null;
+  },
+  ctx: CalendarCtx,
+) {
+  checkAccount(args.accountId, ctx);
+  const client = makeClient(ctx);
+  const cals = await client.listCalendars();
+  const oldState = state(cals);
+  if (args.ifInState && args.ifInState !== oldState) throw new JmapError("stateMismatch", "ifInState does not match");
+
+  const created: Record<string, { id: string; uid: string }> = {};
+  const notCreated: Record<string, SetError> = {};
+  const updated: Record<string, null> = {};
+  const notUpdated: Record<string, SetError> = {};
+  const destroyed: string[] = [];
+  const notDestroyed: Record<string, SetError> = {};
+  const calById = new Map(cals.map((c) => [encodeId(c.href), c]));
+
+  for (const [cid, ev] of Object.entries(args.create ?? {})) {
+    try {
+      const wanted = Object.keys((ev.calendarIds ?? {}) as Record<string, boolean>);
+      const cal = wanted.length ? calById.get(wanted[0]!) : cals[0];
+      if (!cal) throw new JmapError("invalidProperties", "unknown calendar in calendarIds");
+      const uid = typeof ev.uid === "string" && ev.uid ? ev.uid : crypto.randomUUID();
+      // The resource name only has to be unique in the collection; the UID is,
+      // and keeping to a safe character set spares us URL-encoding questions.
+      const href = `${cal.href}${uid.replace(/[^\w.@-]/g, "_")}.ics`;
+      const event: JsEvent = { ...ev, uid, sequence: 0, created: new Date().toISOString() };
+      await client.putEvent(href, eventToIcal(event));
+      created[cid] = { id: encodeId(`${cal.href}\n${href}`), uid };
+    } catch (e) {
+      notCreated[cid] = errorFor(e);
+    }
+  }
+
+  for (const [id, patch] of Object.entries(args.update ?? {})) {
+    try {
+      const parts = splitEventId(id);
+      // Ids we didn't mint include Bulwark's synthetic-id probe; answering
+      // invalidProperties (not notFound) tells it we don't take synthetic
+      // occurrence ids, so it keeps expanding series itself.
+      if (!parts) throw new JmapError("invalidProperties", "not an event id");
+      const calId = encodeId(parts.calHref);
+      if (!calById.has(calId)) throw new JmapError("notFound", "no such calendar");
+      const [res] = await client.fetchEvents(parts.calHref, [parts.href]);
+      const current = res && icalToEvent(res.data, id, calId);
+      if (!res || !current) throw new JmapError("notFound", "no such event");
+
+      const p = Object.fromEntries(Object.entries(patch).filter(([k]) => !EVENT_READ_ONLY.has(k.split("/")[0]!)));
+      if ("calendarIds" in p && JSON.stringify(p.calendarIds) !== JSON.stringify(current.calendarIds)) {
+        throw new JmapError("invalidProperties", "moving events between calendars is not supported");
+      }
+      applyPatch(current, p);
+      if (!("sequence" in p)) current.sequence = (Number(current.sequence) || 0) + 1;
+      await client.putEvent(parts.href, eventToIcal(current, res.data), res.etag);
+      updated[id] = null;
+    } catch (e) {
+      notUpdated[id] = errorFor(e);
+    }
+  }
+
+  for (const id of args.destroy ?? []) {
+    try {
+      const parts = splitEventId(id);
+      if (!parts || !calById.has(encodeId(parts.calHref))) throw new JmapError("notFound", "no such event");
+      await client.deleteEvent(parts.href);
+      destroyed.push(id);
+    } catch (e) {
+      notDestroyed[id] = errorFor(e);
+    }
+  }
+
+  const orNull = <T extends object>(o: T) => (Object.keys(o).length ? o : null);
+  return {
+    accountId: args.accountId,
+    oldState,
+    newState: state(await client.listCalendars()),
+    created: orNull(created),
+    updated: orNull(updated),
+    destroyed: destroyed.length ? destroyed : null,
+    notCreated: orNull(notCreated),
+    notUpdated: orNull(notUpdated),
+    notDestroyed: orNull(notDestroyed),
+  };
 }

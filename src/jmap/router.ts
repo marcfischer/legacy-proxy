@@ -42,7 +42,7 @@ import {
   contactCardQueryChanges,
   contactsAvailable,
 } from "./methods/contacts.js";
-import { calendarGet, calendarEventGet, calendarEventQuery, calendarsAvailable } from "./methods/calendars.js";
+import { calendarGet, calendarEventGet, calendarEventQuery, calendarEventSet, calendarsAvailable } from "./methods/calendars.js";
 import { threadGet, threadChanges } from "./methods/threads.js";
 import { pushSubscriptionGet, pushSubscriptionSet } from "./methods/push.js";
 import { resolveProvider } from "../auth/providers.js";
@@ -194,6 +194,11 @@ export function makeMethodTable(): Record<string, Handler> {
       const provider = resolveProvider(c.cfg, c.account.kind);
       const creds = await openCredentials(c.cfg.vaultKey, c.account.vault);
       return calendarEventGet(a as never, { account: c.account, provider, creds });
+    },
+    "CalendarEvent/set": async (a, c) => {
+      const provider = resolveProvider(c.cfg, c.account.kind);
+      const creds = await openCredentials(c.cfg.vaultKey, c.account.vault);
+      return calendarEventSet(a as never, { account: c.account, provider, creds });
     },
     "Mailbox/get": async (a, c) =>
       c.pool.withConnection(c.account, "interactive", (client) =>

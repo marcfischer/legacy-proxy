@@ -63,8 +63,8 @@ JMAP method coverage:
 | PushSubscription  | `get`, `set` (verification handshake, relay forwarding, expiry caps) |
 | AddressBook       | `get`, `changes`, `set` (extended MKCOL / PROPPATCH / DELETE via CardDAV) |
 | ContactCard       | `get`, `query`, `queryChanges`, `changes`, `set` (PUT / DELETE via CardDAV) |
-| Calendar          | `get` (read-only, via CalDAV)                                         |
-| CalendarEvent     | `get`, `query` (`inCalendar(s)`, `after` / `before`; read-only, via CalDAV) |
+| Calendar          | `get` (via CalDAV; calendars can't be created or renamed yet)         |
+| CalendarEvent     | `get`, `query` (`inCalendar(s)`, `after` / `before`), `set` (PUT / DELETE via CalDAV) |
 | Quota             | `get` (stub returning empty list, so probing clients don't error)    |
 
 Capabilities advertised on the Session resource:
@@ -109,11 +109,15 @@ Backends:
   A CardDAV account with no collections at all (a fresh Radicale user, for
   example) gets a `Contacts` address book created on the first
   `ContactCard/set`.
-- CalDAV (RFC 4791) for Calendar and CalendarEvent, read-only. Event lists
-  are a `calendar-query` with the JMAP `after` / `before` range passed through
-  as a `time-range`; bodies come from `calendar-multiget` and are projected to
+- CalDAV (RFC 4791) for Calendar and CalendarEvent. Event lists are a
+  `calendar-query` with the JMAP `after` / `before` range passed through as a
+  `time-range`; bodies come from `calendar-multiget` and are projected to
   JSCalendar. Recurring series are returned as rules plus overrides, not
-  expanded; tasks (VTODO) are skipped.
+  expanded; tasks (VTODO) are skipped. Writes are `PUT` (`If-None-Match: *` /
+  `If-Match`) and `DELETE`; an update re-serialises the event but keeps its
+  VTIMEZONEs and any properties the projection doesn't model. Moving an event
+  to another calendar is rejected, and the server's own scheduling decides
+  whether attendees get invitations (`sendSchedulingMessages` is ignored).
 
 Auth and storage:
 

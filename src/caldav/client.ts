@@ -113,7 +113,26 @@ export class CalDavClient extends CardDavClient {
     return out.concat(fetched.flat());
   }
 
-  private async fetchEvents(calHref: string, hrefs: string[]): Promise<ICalResource[]> {
+  /** PUT an iCalendar resource; same If-Match / If-None-Match rules as the CardDAV putResource. */
+  async putEvent(href: string, ics: string, ifMatch?: string | null): Promise<{ etag: string | null }> {
+    this.forget(href);
+    return this.putResource(href, ics, { ifMatch, contentType: "text/calendar; charset=utf-8" });
+  }
+
+  async deleteEvent(href: string): Promise<void> {
+    this.forget(href);
+    await this.deleteResource(href);
+  }
+
+  // A write changes the calendar's ctag (and so the JMAP state) and the
+  // resource's etag, so neither cached value may be served afterwards.
+  private forget(href: string): void {
+    calListCache.delete(this.cacheKey);
+    etagCache.delete(`${this.cacheKey}|${href}`);
+  }
+
+  /** Fetch bodies from the server, bypassing the cache (writes need the current etag). */
+  async fetchEvents(calHref: string, hrefs: string[]): Promise<ICalResource[]> {
     const body =
       `<?xml version="1.0" encoding="utf-8"?>\n` +
       `<C:calendar-multiget ${CAL_NS}><D:prop><D:getetag/><C:calendar-data/></D:prop>` +

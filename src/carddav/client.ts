@@ -310,9 +310,9 @@ export class CardDavClient {
   async putResource(
     href: string,
     vcard: string,
-    opts: { ifMatch?: string | null } = {},
+    opts: { ifMatch?: string | null; contentType?: string } = {},
   ): Promise<{ etag: string | null }> {
-    const headers: Record<string, string> = { "Content-Type": "text/vcard; charset=utf-8" };
+    const headers: Record<string, string> = { "Content-Type": opts.contentType ?? "text/vcard; charset=utf-8" };
     if (opts.ifMatch) headers["If-Match"] = opts.ifMatch;
     else headers["If-None-Match"] = "*";
     const res = await this.raw("PUT", href, vcard, headers);
