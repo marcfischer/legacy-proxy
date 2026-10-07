@@ -21,6 +21,8 @@ export interface CardDavOpts {
   basePath?: string;        // e.g. "/dav" - root of the DAV namespace
   principalPath?: string;   // override discovery, e.g. "/dav/addressbook/user@x.io/"
   creds: Credentials;
+  /** Discover calendar-home-set (RFC 4791) instead of addressbook-home-set. */
+  caldav?: boolean;
 }
 
 export interface AddressBookInfo {
@@ -139,7 +141,7 @@ export class CardDavClient {
     const proto = opts.secure ? "https" : "http";
     this.origin = `${proto}://${opts.host}:${opts.port}`;
     this.authHeader = buildAuth(opts.creds);
-    this.cacheKey = `${this.origin}|${opts.creds.username}|${opts.basePath ?? ""}|${opts.principalPath ?? ""}`;
+    this.cacheKey = `${this.origin}|${opts.creds.username}|${opts.basePath ?? ""}|${opts.principalPath ?? ""}${opts.caldav ? "|cal" : ""}`;
   }
 
   /** Find the principal URL via /.well-known/carddav (RFC 6764 §6). */
@@ -149,7 +151,7 @@ export class CardDavClient {
     const cached = freshEntry(discoveryCache.get(this.cacheKey), DISCOVERY_TTL_MS);
     if (cached?.principal) return cached.principal;
 
-    const start = this.opts.basePath ?? "/.well-known/carddav";
+    const start = this.opts.basePath ?? (this.opts.caldav ? "/.well-known/caldav" : "/.well-known/carddav");
     // 1. follow redirects from .well-known to the DAV root.
     const root = await this.followToCollection(start);
 
@@ -168,10 +170,11 @@ export class CardDavClient {
     if (cached?.home) return cached.home;
 
     const principal = await this.discoverPrincipal();
-    const homeXml = await this.propfind(principal, 0, [
-      "urn:ietf:params:xml:ns:carddav addressbook-home-set",
-    ]);
-    const found = pickHref(homeXml, "addressbook-home-set") ?? principal;
+    const homeSet = this.opts.caldav
+      ? "urn:ietf:params:xml:ns:caldav calendar-home-set"
+      : "urn:ietf:params:xml:ns:carddav addressbook-home-set";
+    const homeXml = await this.propfind(principal, 0, [homeSet]);
+    const found = pickHref(homeXml, splitProp(homeSet)[1]) ?? principal;
     const home = found.endsWith("/") ? found : found + "/";
     this.rememberDiscovery({ home });
     return home;
@@ -428,7 +431,7 @@ export class CardDavClient {
     throw new Error("CardDAV: too many redirects in discovery");
   }
 
-  private async propfind(path: string, depth: 0 | 1, props: string[]): Promise<string> {
+  protected async propfind(path: string, depth: 0 | 1, props: string[]): Promise<string> {
     const ns = collectNamespaces(props);
     const propXml = props.map((p) => {
       const [nsUri, name] = splitProp(p);
@@ -444,7 +447,7 @@ export class CardDavClient {
     return this.request("PROPFIND", path, body, { Depth: String(depth) });
   }
 
-  private async request(
+  protected async request(
     method: string,
     path: string,
     body: string,
@@ -532,6 +535,7 @@ function collectNamespaces(props: string[]): { prefix(uri: string): string; decl
   const map = new Map<string, string>([
     ["DAV:", "D"],
     ["urn:ietf:params:xml:ns:carddav", "C"],
+    ["urn:ietf:params:xml:ns:caldav", "CAL"],
     ["http://calendarserver.org/ns/", "CS"],
   ]);
   for (const p of props) {
@@ -586,11 +590,11 @@ export function textOf(chunk: string, localName: string): string | null {
 export function hasResourceType(chunk: string, localName: string): boolean {
   const block = textOf(chunk, "resourcetype");
   if (block !== null) {
-    return new RegExp(`<(?:[A-Za-z][\\w-]*:)?${localName}\\b`, "i").test(block);
+    return new RegExp(`<(?:[A-Za-z][\\w-]*:)?${localName}(?![\\w-])`, "i").test(block);
   }
   // Some servers return resourcetype as a self-closing wrapper; fall back to a
   // raw scan of the chunk.
-  return new RegExp(`<(?:[A-Za-z][\\w-]*:)?resourcetype\\b[^>]*>[\\s\\S]*?<(?:[A-Za-z][\\w-]*:)?${localName}\\b`, "i").test(chunk);
+  return new RegExp(`<(?:[A-Za-z][\\w-]*:)?resourcetype\\b[^>]*>[\\s\\S]*?<(?:[A-Za-z][\\w-]*:)?${localName}(?![\\w-])`, "i").test(chunk);
 }
 
 /** Pick the first href inside the named element, e.g. <addressbook-home-set><href>…</href></addressbook-home-set>. */

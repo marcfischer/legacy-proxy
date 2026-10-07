@@ -42,6 +42,7 @@ import {
   contactCardQueryChanges,
   contactsAvailable,
 } from "./methods/contacts.js";
+import { calendarGet, calendarEventGet, calendarEventQuery, calendarsAvailable } from "./methods/calendars.js";
 import { threadGet, threadChanges } from "./methods/threads.js";
 import { pushSubscriptionGet, pushSubscriptionSet } from "./methods/push.js";
 import { resolveProvider } from "../auth/providers.js";
@@ -170,6 +171,29 @@ export function makeMethodTable(): Record<string, Handler> {
       const provider = resolveProvider(c.cfg, c.account.kind);
       const creds = await openCredentials(c.cfg.vaultKey, c.account.vault);
       return contactCardQueryChanges(a as never, { account: c.account, provider, creds });
+    },
+    "Calendar/get": async (a, c) => {
+      const provider = resolveProvider(c.cfg, c.account.kind);
+      if (!calendarsAvailable(provider)) {
+        return {
+          accountId: (a as { accountId?: string }).accountId ?? String(c.account.id),
+          state: "0",
+          list: [],
+          notFound: ((a as { ids?: string[] | null }).ids ?? []) as string[],
+        };
+      }
+      const creds = await openCredentials(c.cfg.vaultKey, c.account.vault);
+      return calendarGet(a as never, { account: c.account, provider, creds });
+    },
+    "CalendarEvent/query": async (a, c) => {
+      const provider = resolveProvider(c.cfg, c.account.kind);
+      const creds = await openCredentials(c.cfg.vaultKey, c.account.vault);
+      return calendarEventQuery(a as never, { account: c.account, provider, creds });
+    },
+    "CalendarEvent/get": async (a, c) => {
+      const provider = resolveProvider(c.cfg, c.account.kind);
+      const creds = await openCredentials(c.cfg.vaultKey, c.account.vault);
+      return calendarEventGet(a as never, { account: c.account, provider, creds });
     },
     "Mailbox/get": async (a, c) =>
       c.pool.withConnection(c.account, "interactive", (client) =>
@@ -342,6 +366,9 @@ const PARALLEL_SAFE_METHODS = new Set([
   "ContactCard/query",
   "ContactCard/changes",
   "ContactCard/queryChanges",
+  "Calendar/get",
+  "CalendarEvent/get",
+  "CalendarEvent/query",
   "PushSubscription/get",
 ]);
 

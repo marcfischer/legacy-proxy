@@ -1,4 +1,4 @@
-import type { AppConfig, ProviderConfig } from "../util/config.js";
+import type { AppConfig, DavConfig, ProviderConfig } from "../util/config.js";
 
 export function resolveProvider(cfg: AppConfig, name?: string): ProviderConfig {
   const key = name ?? cfg.defaultProvider;
@@ -43,17 +43,22 @@ function interpolate(p: ProviderConfig): ProviderConfig {
     imap: { ...p.imap, host: env(p.imap.host) },
     smtp: { ...p.smtp, host: env(p.smtp.host) },
     sieve: p.sieve ? { ...p.sieve, host: env(p.sieve.host) } : null,
-    carddav: p.carddav
-      ? {
-          ...p.carddav,
-          host: env(p.carddav.host),
-          basePath: p.carddav.basePath ? env(p.carddav.basePath) : undefined,
-          principalPath: p.carddav.principalPath ? env(p.carddav.principalPath) : undefined,
-          username: p.carddav.username ? env(p.carddav.username) : undefined,
-          password: p.carddav.password ? env(p.carddav.password) : undefined,
-        }
-      : null,
+    carddav: dav(p.carddav),
+    caldav: dav(p.caldav),
     auth: p.auth,
+  };
+}
+
+function dav(d: DavConfig | null | undefined): DavConfig | null {
+  if (!d) return null;
+  const opt = (s?: string) => (s ? env(s) : undefined);
+  return {
+    ...d,
+    host: env(d.host),
+    basePath: opt(d.basePath),
+    principalPath: opt(d.principalPath),
+    username: opt(d.username),
+    password: opt(d.password),
   };
 }
 

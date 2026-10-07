@@ -7,6 +7,7 @@ export const VACATION_CAPABILITY = "urn:ietf:params:jmap:vacationresponse";
 export const WS_CAPABILITY = "urn:ietf:params:jmap:websocket";
 export const SIEVE_CAPABILITY = "urn:bulwark:params:jmap:sieve";
 export const CONTACTS_CAPABILITY = "urn:ietf:params:jmap:contacts";
+export const CALENDARS_CAPABILITY = "urn:ietf:params:jmap:calendars";
 
 // Every capability the /jmap endpoint accepts in a request's `using` list
 // (RFC 8620 §3.6.1). Must cover everything buildSession can advertise —
@@ -19,6 +20,7 @@ export const KNOWN_CAPABILITIES: ReadonlySet<string> = new Set([
   VACATION_CAPABILITY,
   SIEVE_CAPABILITY,
   CONTACTS_CAPABILITY,
+  CALENDARS_CAPABILITY,
 ]);
 
 export function coreCapabilityProps(cfg: AppConfig) {
@@ -56,6 +58,11 @@ export function submissionCapabilityProps() {
     maxDelayedSend: 0,
     submissionExtensions: {},
   };
+}
+
+export function calendarsCapabilityProps() {
+  // CalDAV resources live in exactly one collection; calendar creation is not wired up yet.
+  return { maxCalendarsPerEvent: 1, mayCreateCalendar: false };
 }
 
 export function contactsCapabilityProps() {
