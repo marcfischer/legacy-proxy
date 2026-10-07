@@ -3,7 +3,6 @@ import type { FetchMessageObject, ImapFlow } from "imapflow";
 // eslint-disable-next-line @typescript-eslint/ban-ts-comment
 // @ts-expect-error no declaration file
 import libqp from "libqp";
-import { simpleParser } from "mailparser";
 import { selectBodies, structureToBodyParts, type EmailBodyPart } from "../mapping/structure.js";
 import { flagsToKeywords } from "../mapping/flags.js";
 import { encodeBlobId, encodeEmailId, encodeMailboxId } from "../mapping/ids.js";
@@ -294,8 +293,7 @@ async function fetchBodyValuesBatched(
   items: { uid: number; wanted: Map<string, EmailBodyPart> }[],
   opts: BodyFetchOpts,
 ): Promise<Map<number, JmapEmail["bodyValues"]>> {
-  // RFC 8621 §4.2: 0 means "do not truncate", not "truncate to nothing".
-  const cap = opts.maxBodyValueBytes === 0 ? Infinity : (opts.maxBodyValueBytes ?? 256_000);
+  const cap = opts.maxBodyValueBytes ?? 256_000;
   const out = new Map<number, JmapEmail["bodyValues"]>();
   const groups = new Map<string, { partIds: string[]; members: typeof items }>();
   for (const item of items) {
@@ -315,29 +313,25 @@ async function fetchBodyValuesBatched(
 
   for (const g of groups.values()) {
     const byUid = new Map(g.members.map((m) => [m.uid, m]));
-    const rawByUid = await fetchRawParts(client, g.members.map((m) => m.uid), g.partIds);
-    // One message the server cannot serve fails the whole UID FETCH. Retry
-    // the stragglers one by one so a single broken message does not blank
-    // out every sibling that happened to share its MIME shape.
-    if (g.members.length > 1) {
-      for (const m of g.members) {
-        if (rawByUid.has(m.uid)) continue;
-        const single = await fetchRawParts(client, [m.uid], g.partIds);
-        const parts = single.get(m.uid);
-        if (parts) rawByUid.set(m.uid, parts);
+    const rawByUid = new Map<number, Map<string, Buffer>>();
+    try {
+      for await (const msg of fetchByUid(
+        client,
+        g.members.map((m) => m.uid),
+        { uid: true, bodyParts: g.partIds },
+      )) {
+        if (msg.uid != null && msg.bodyParts) rawByUid.set(msg.uid, msg.bodyParts);
       }
+    } catch (e) {
+      // fall through: members without raw parts get isEncodingProblem below
+      log.warn({ uids: g.members.length, partIds: g.partIds, ...imapErrorDetails(e) }, "body part FETCH failed");
     }
     for (const m of g.members) {
       const bodyParts = rawByUid.get(m.uid);
       const values: JmapEmail["bodyValues"] = {};
-      const missing: string[] = [];
       for (const [partId, part] of byUid.get(m.uid)!.wanted) {
         const raw = bodyParts?.get(partId);
-        // A part the BODYSTRUCTURE says has content but that comes back
-        // empty is as unusable as a missing one; flag both so the client
-        // can tell "no body" from "server returned nothing".
-        if (!raw || (raw.length === 0 && part.size > 0)) {
-          missing.push(partId);
+        if (!raw) {
           values[partId] = { value: "", isEncodingProblem: true, isTruncated: false };
           continue;
         }
@@ -350,76 +344,8 @@ async function fetchBodyValuesBatched(
           isTruncated: truncated,
         };
       }
-      if (missing.length > 0) {
-        const wanted = byUid.get(m.uid)!.wanted;
-        const recovered = await recoverPartsFromSource(client, m.uid, missing.map((id) => wanted.get(id)!), cap);
-        for (const [partId, value] of recovered) values[partId] = value;
-        log.warn(
-          {
-            uid: m.uid,
-            partIds: missing,
-            // What the server actually answered: part keys with byte counts.
-            response: bodyParts
-              ? [...bodyParts].map(([k, v]) => `${k}:${v?.length ?? "null"}`)
-              : null,
-            recovered: [...recovered.keys()],
-          },
-          "IMAP server returned no content for body parts",
-        );
-      }
       out.set(m.uid, values);
     }
-  }
-  return out;
-}
-
-// Fallback for servers that answer BODY[<part>] with nothing although the
-// BODYSTRUCTURE lists content: fetch the whole message and let mailparser
-// find the text and HTML bodies. Parts are matched by media type, so only a
-// part that is the sole missing one of its type is filled in.
-async function recoverPartsFromSource(
-  client: ImapFlow,
-  uid: number,
-  parts: EmailBodyPart[],
-  cap: number,
-): Promise<Map<string, JmapEmail["bodyValues"][string]>> {
-  const out = new Map<string, JmapEmail["bodyValues"][string]>();
-  let source: Buffer | undefined;
-  try {
-    for await (const msg of fetchByUid(client, [uid], { uid: true, source: true })) {
-      if (msg.uid === uid && msg.source) source = msg.source;
-    }
-  } catch (e) {
-    log.warn({ uid, ...imapErrorDetails(e) }, "full message FETCH failed");
-    return out;
-  }
-  if (!source || source.length === 0) {
-    log.warn({ uid }, "IMAP server returned no content for the full message either");
-    return out;
-  }
-  let parsed;
-  try {
-    parsed = await simpleParser(source);
-  } catch (e) {
-    log.warn({ uid, sourceBytes: source.length, err: (e as Error).message }, "parsing full message failed");
-    return out;
-  }
-  const byType: Record<string, string | undefined> = {
-    "text/plain": parsed.text || undefined,
-    "text/html": typeof parsed.html === "string" ? parsed.html : undefined,
-  };
-  for (const part of parts) {
-    if (!part.partId) continue;
-    const text = byType[part.type];
-    if (text === undefined) continue;
-    if (parts.filter((p) => p.type === part.type).length > 1) continue;
-    const bytes = Buffer.from(text, "utf8");
-    const truncated = bytes.length > cap;
-    out.set(part.partId, {
-      value: truncated ? new TextDecoder().decode(bytes.subarray(0, cap)) : text,
-      isEncodingProblem: false,
-      isTruncated: truncated,
-    });
   }
   return out;
 }
@@ -441,27 +367,6 @@ export function imapErrorDetails(e: unknown): Record<string, unknown> {
     serverResponseCode: err?.serverResponseCode,
     code: err?.code,
   };
-}
-
-// UID FETCH the given parts for a set of messages. A failure is logged and
-// yields whatever arrived before it; the caller decides how to retry.
-async function fetchRawParts(
-  client: ImapFlow,
-  uids: number[],
-  partIds: string[],
-): Promise<Map<number, Map<string, Buffer>>> {
-  const rawByUid = new Map<number, Map<string, Buffer>>();
-  try {
-    for await (const msg of fetchByUid(client, uids, { uid: true, bodyParts: partIds })) {
-      if (msg.uid != null && msg.bodyParts) rawByUid.set(msg.uid, msg.bodyParts);
-    }
-  } catch (e) {
-    log.warn(
-      { uids: uids.length > 20 ? `${uids.length} uids` : uids, partIds, ...imapErrorDetails(e) },
-      "body part FETCH failed",
-    );
-  }
-  return rawByUid;
 }
 
 // Fetch preview snippets for the given messages, batching one FETCH per
