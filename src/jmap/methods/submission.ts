@@ -221,7 +221,7 @@ export async function emailSubmissionSet(
       const sendLog = {
         emailId: payload.emailId,
         mailFrom: env.from,
-        rcptCount: env.to.length,
+        rcptTo: env.to,
         accepted: result.accepted.length,
         rejected: result.rejected,
         smtpResponse: result.response,
