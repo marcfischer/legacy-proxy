@@ -248,7 +248,9 @@ app.get<{ Params: { accountId: string; blobId: string; type: string; name: strin
         parsed.partId ?? undefined,
         { uid: true },
       );
-      if (!dl) {
+      // imapflow hands back an object without `content` when the UID or part
+      // doesn't exist; piping that would throw instead of answering 404.
+      if (!dl?.content) {
         release();
         return reply.code(404).send({ error: "blob not found" });
       }
