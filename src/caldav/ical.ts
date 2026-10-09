@@ -60,6 +60,15 @@ export function icalToEvents(ics: string): JsEvent[] {
   return [...byUid.values()].map((group) => veventsToEvent(group, null, null)!);
 }
 
+/**
+ * Highest SEQUENCE across a resource's VEVENTs. Overrides can be ahead of the
+ * master - mailbox.org bumps an edited override's SEQUENCE but leaves the
+ * master's alone - so a rewrite has to start above all of them.
+ */
+export function highestSequence(ics: string): number {
+  return Math.max(0, ...vevents(ics).map((v) => Number(prop(v, "SEQUENCE")?.value ?? 0) || 0));
+}
+
 function vevents(ics: string): Component[] {
   return parseComponents(ics)
     .flatMap((c) => c.children)
