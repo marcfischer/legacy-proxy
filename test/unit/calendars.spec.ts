@@ -1,13 +1,16 @@
 // End-to-end tests for Calendar/get and CalendarEvent/query, /get and /set
 // against a fake CalDAV server on globalThis.fetch, logging in with the
 // provider's own DAV credentials rather than the mail ones. CalendarEvent/parse
-// only reads uploads, so it gets a fake store instead.
+// reads blobs, not CalDAV, so it gets a fake store and IMAP pool instead.
 
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { calendarEventGet, calendarEventParse, calendarEventQuery, calendarEventSet, calendarGet, type CalendarCtx } from "../../src/jmap/methods/calendars.js";
 import { resetCardDavCaches } from "../../src/carddav/client.js";
 import { resetCalDavCaches } from "../../src/caldav/client.js";
+import { Readable } from "node:stream";
 import type { AccountRow, Store } from "../../src/state/store.js";
+import type { ImapPool } from "../../src/imap/pool.js";
+import { encodeBlobId, encodeEmailId } from "../../src/mapping/ids.js";
 import type { ProviderConfig } from "../../src/util/config.js";
 
 const EVENT = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\nDTSTART:20261007T120000Z\r\nDTEND:20261007T130000Z\r\nSUMMARY:Lunch & talk\r\nEND:VEVENT\r\nEND:VCALENDAR";
@@ -131,20 +134,35 @@ it("creates, updates (incl. a single occurrence) and destroys events", async () 
   expect([...store.keys()]).toEqual(["/cal/u/work/1.ics"]);
 });
 
-it("parses uploaded .ics files and reports unknown or event-less blobs", () => {
+it("parses uploaded .ics files and invitation parts, reporting unknown or event-less blobs", async () => {
   const uploads = new Map([
     ["Uics", Buffer.from(EVENT)],
     ["Utodo", Buffer.from("BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:t\r\nEND:VTODO\r\nEND:VCALENDAR")],
   ]);
+  const invite = encodeBlobId(encodeEmailId({ accountIdx: 1, mailboxIdx: 7, uidvalidity: 1, uid: 42 }), "2");
+  const gone = encodeBlobId(encodeEmailId({ accountIdx: 1, mailboxIdx: 9, uidvalidity: 1, uid: 1 }), "2");
   const fakeStore = {
     getUpload: (id: string, accountId: number) => (accountId === 1 && uploads.has(id) ? { ctype: "text/calendar", body: uploads.get(id)! } : null),
+    getCachedBlob: () => null,
+    prep: () => ({ get: (mailboxIdx: number) => (mailboxIdx === 7 ? { id: 7, name: "INBOX" } : undefined) }),
   } as unknown as Store;
-  const ctx = { account: { id: 1 } as AccountRow, store: fakeStore };
+  const downloads: unknown[][] = [];
+  const fakeClient = {
+    getMailboxLock: async () => ({ release: () => {} }),
+    download: async (...a: unknown[]) => {
+      downloads.push(a);
+      return { content: Readable.from([Buffer.from(EVENT)]) };
+    },
+  };
+  const fakePool = { withConnection: (_a: unknown, _r: unknown, fn: (c: unknown) => unknown) => fn(fakeClient) } as unknown as ImapPool;
+  const ctx = { account: { id: 1 } as AccountRow, store: fakeStore, pool: fakePool };
 
-  const res = calendarEventParse({ accountId: "1", blobIds: ["Uics", "Utodo", "Umissing", "M1-2"] }, ctx);
+  const res = await calendarEventParse({ accountId: "1", blobIds: ["Uics", invite, "Utodo", "Umissing", gone, "garbage"] }, ctx);
   expect(res.parsed.Uics).toHaveLength(1);
   expect(res.parsed.Uics![0]).toMatchObject({ uid: "u1", title: "Lunch & talk", utcStart: "2026-10-07T12:00:00Z", duration: "PT1H" });
+  expect(res.parsed[invite]![0]).toMatchObject({ uid: "u1" });
+  expect(downloads).toEqual([["42", "2", { uid: true }]]);
   expect(res.notParsable).toEqual(["Utodo"]);
-  expect(res.notFound).toEqual(["Umissing", "M1-2"]);
-  expect(() => calendarEventParse({ accountId: "2", blobIds: [] }, ctx)).toThrow();
+  expect(res.notFound).toEqual(["Umissing", gone, "garbage"]);
+  await expect(calendarEventParse({ accountId: "2", blobIds: [] }, ctx)).rejects.toThrow();
 });
