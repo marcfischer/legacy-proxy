@@ -139,9 +139,14 @@ export class CalDavClient extends CardDavClient {
       hrefs.map((h) => `<D:href>${h.replace(/&/g, "&amp;").replace(/</g, "&lt;")}</D:href>`).join("") +
       `</C:calendar-multiget>`;
     const xml = await this.request("REPORT", calHref, body, { Depth: "1" });
+    // Servers may answer with a differently encoded href than we asked for
+    // (`%40` for the `@` most invitation UIDs carry, or an absolute URL), and
+    // callers look results up by the href they passed in, so hand that back.
+    const asked = new Map(hrefs.map((h) => [normalizeHref(h), h]));
     const out: ICalResource[] = [];
     for (const r of splitResponses(xml)) {
-      const href = extractHref(r);
+      const raw = extractHref(r);
+      const href = raw && (asked.get(normalizeHref(raw)) ?? raw);
       const data = textOf(r, "calendar-data");
       if (!href || !data) continue;
       const etag = textOf(r, "getetag");
@@ -149,6 +154,15 @@ export class CalDavClient extends CardDavClient {
       out.push({ href, etag, data });
     }
     return out;
+  }
+}
+
+function normalizeHref(href: string): string {
+  const path = href.replace(/^https?:\/\/[^/]+/i, "");
+  try {
+    return decodeURIComponent(path);
+  } catch {
+    return path;
   }
 }
 

@@ -20,8 +20,9 @@ const ms = (body: string) =>
 let reports: string[] = [];
 let store = new Map<string, { data: string; etag: string }>();
 let etagSeq = 1;
+// Like real servers, answer with percent-encoded hrefs (`@` -> `%40`).
 const resp = (href: string, r: { data: string; etag: string }) =>
-  `<D:response><D:href>${href}</D:href><D:propstat><D:prop><D:getetag>${r.etag}</D:getetag><C:calendar-data>${r.data.replace(/&/g, "&amp;").replace(/</g, "&lt;")}</C:calendar-data></D:prop></D:propstat></D:response>`;
+  `<D:response><D:href>${href.replace(/@/g, "%40")}</D:href><D:propstat><D:prop><D:getetag>${r.etag}</D:getetag><C:calendar-data>${r.data.replace(/&/g, "&amp;").replace(/</g, "&lt;")}</C:calendar-data></D:prop></D:propstat></D:response>`;
 
 beforeEach(() => {
   resetCardDavCaches();
@@ -48,7 +49,7 @@ beforeEach(() => {
       );
     if (init.method === "REPORT") {
       reports.push(body);
-      const wanted = body.includes("calendar-multiget") ? [...body.matchAll(/<D:href>([^<]+)<\/D:href>/g)].map((m) => m[1]!) : [...store.keys()];
+      const wanted = body.includes("calendar-multiget") ? [...body.matchAll(/<D:href>([^<]+)<\/D:href>/g)].map((m) => decodeURIComponent(m[1]!)) : [...store.keys()];
       return ms(wanted.filter((h) => store.has(h)).map((h) => resp(h, store.get(h)!)).join(""));
     }
     const headers = init.headers as Record<string, string>;
@@ -101,7 +102,7 @@ it("creates, updates (incl. a single occurrence) and destroys events", async () 
     accountId: "1",
     create: {
       n1: {
-        calendarIds: { [calId]: true }, title: "Standup", start: "2026-10-05T09:00:00", timeZone: "Europe/Berlin", duration: "PT15M",
+        calendarIds: { [calId]: true }, uid: "standup@example.org", title: "Standup", start: "2026-10-05T09:00:00", timeZone: "Europe/Berlin", duration: "PT15M",
         recurrenceRule: { "@type": "RecurrenceRule", frequency: "weekly", byDay: [{ day: "mo" }] },
       },
     },
