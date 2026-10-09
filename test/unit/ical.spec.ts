@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { eventToIcal, icalToEvent, localToUtc, utcToLocal } from "../../src/caldav/ical.js";
+import { eventToIcal, icalToEvent, icalToEvents, localToUtc, utcToLocal } from "../../src/caldav/ical.js";
 
 const series = [
   "BEGIN:VCALENDAR",
@@ -77,6 +77,22 @@ describe("icalToEvent", () => {
       duration: "P3D",
     });
     expect(icalToEvent("BEGIN:VCALENDAR\nBEGIN:VTODO\nUID:t\nEND:VTODO\nEND:VCALENDAR", "t", "c")).toBeNull();
+  });
+});
+
+describe("icalToEvents", () => {
+  it("returns one event per UID, keeping a series and its overrides together", () => {
+    const other = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:xyz\r\nDTSTART;VALUE=DATE:20261224\r\nSUMMARY:Heiligabend\r\nEND:VEVENT\r\nEND:VCALENDAR";
+    const evs = icalToEvents(`${series}\r\n${other}`);
+    expect(evs.map((e) => e.uid)).toEqual(["abc-123", "xyz"]);
+    expect(evs[0]).toMatchObject({ id: null, calendarIds: null, title: "Team, weekly" });
+    expect(Object.keys(evs[0]!.recurrenceOverrides as object)).toHaveLength(2);
+    expect(evs[1]).toMatchObject({ title: "Heiligabend", showWithoutTime: true });
+  });
+
+  it("returns nothing for a file without events", () => {
+    expect(icalToEvents("BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:t\r\nEND:VTODO\r\nEND:VCALENDAR")).toEqual([]);
+    expect(icalToEvents("not a calendar")).toEqual([]);
   });
 });
 

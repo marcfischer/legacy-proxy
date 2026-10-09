@@ -42,7 +42,7 @@ import {
   contactCardQueryChanges,
   contactsAvailable,
 } from "./methods/contacts.js";
-import { calendarGet, calendarEventGet, calendarEventQuery, calendarEventSet, calendarsAvailable } from "./methods/calendars.js";
+import { calendarGet, calendarEventGet, calendarEventParse, calendarEventQuery, calendarEventSet, calendarsAvailable } from "./methods/calendars.js";
 import { threadGet, threadChanges } from "./methods/threads.js";
 import { pushSubscriptionGet, pushSubscriptionSet } from "./methods/push.js";
 import { resolveProvider } from "../auth/providers.js";
@@ -200,6 +200,8 @@ export function makeMethodTable(): Record<string, Handler> {
       const creds = await openCredentials(c.cfg.vaultKey, c.account.vault);
       return calendarEventSet(a as never, { account: c.account, provider, creds });
     },
+    "CalendarEvent/parse": async (a, c) =>
+      calendarEventParse(a as never, { account: c.account, store: c.store }),
     "Mailbox/get": async (a, c) =>
       c.pool.withConnection(c.account, "interactive", (client) =>
         mailboxGet(a as never, { account: c.account, client, store: c.store }),
@@ -374,6 +376,7 @@ const PARALLEL_SAFE_METHODS = new Set([
   "Calendar/get",
   "CalendarEvent/get",
   "CalendarEvent/query",
+  "CalendarEvent/parse",
   "PushSubscription/get",
 ]);
 

@@ -1,12 +1,13 @@
 // End-to-end tests for Calendar/get and CalendarEvent/query, /get and /set
 // against a fake CalDAV server on globalThis.fetch, logging in with the
-// provider's own DAV credentials rather than the mail ones.
+// provider's own DAV credentials rather than the mail ones. CalendarEvent/parse
+// only reads uploads, so it gets a fake store instead.
 
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { calendarEventGet, calendarEventQuery, calendarEventSet, calendarGet, type CalendarCtx } from "../../src/jmap/methods/calendars.js";
+import { calendarEventGet, calendarEventParse, calendarEventQuery, calendarEventSet, calendarGet, type CalendarCtx } from "../../src/jmap/methods/calendars.js";
 import { resetCardDavCaches } from "../../src/carddav/client.js";
 import { resetCalDavCaches } from "../../src/caldav/client.js";
-import type { AccountRow } from "../../src/state/store.js";
+import type { AccountRow, Store } from "../../src/state/store.js";
 import type { ProviderConfig } from "../../src/util/config.js";
 
 const EVENT = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\nDTSTART:20261007T120000Z\r\nDTEND:20261007T130000Z\r\nSUMMARY:Lunch & talk\r\nEND:VEVENT\r\nEND:VCALENDAR";
@@ -128,4 +129,22 @@ it("creates, updates (incl. a single occurrence) and destroys events", async () 
   const del = await calendarEventSet({ accountId: "1", destroy: [id] }, ctx);
   expect(del.destroyed).toEqual([id]);
   expect([...store.keys()]).toEqual(["/cal/u/work/1.ics"]);
+});
+
+it("parses uploaded .ics files and reports unknown or event-less blobs", () => {
+  const uploads = new Map([
+    ["Uics", Buffer.from(EVENT)],
+    ["Utodo", Buffer.from("BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:t\r\nEND:VTODO\r\nEND:VCALENDAR")],
+  ]);
+  const fakeStore = {
+    getUpload: (id: string, accountId: number) => (accountId === 1 && uploads.has(id) ? { ctype: "text/calendar", body: uploads.get(id)! } : null),
+  } as unknown as Store;
+  const ctx = { account: { id: 1 } as AccountRow, store: fakeStore };
+
+  const res = calendarEventParse({ accountId: "1", blobIds: ["Uics", "Utodo", "Umissing", "M1-2"] }, ctx);
+  expect(res.parsed.Uics).toHaveLength(1);
+  expect(res.parsed.Uics![0]).toMatchObject({ uid: "u1", title: "Lunch & talk", utcStart: "2026-10-07T12:00:00Z", duration: "PT1H" });
+  expect(res.notParsable).toEqual(["Utodo"]);
+  expect(res.notFound).toEqual(["Umissing", "M1-2"]);
+  expect(() => calendarEventParse({ accountId: "2", blobIds: [] }, ctx)).toThrow();
 });

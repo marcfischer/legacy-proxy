@@ -42,9 +42,31 @@ export function parseComponents(text: string): Component[] {
  * no VEVENT (e.g. a VTODO).
  */
 export function icalToEvent(text: string, id: string, calendarId: string): JsEvent | null {
-  const vevents = parseComponents(text)
+  return veventsToEvent(vevents(text), id, calendarId);
+}
+
+/**
+ * Convert a whole iCalendar file - an .ics import or an invitation - to one
+ * JSCalendar Event per UID, for CalendarEvent/parse. Unlike a CalDAV resource
+ * such a file may carry any number of unrelated events.
+ */
+export function icalToEvents(ics: string): JsEvent[] {
+  const byUid = new Map<string, Component[]>();
+  for (const v of vevents(ics)) {
+    const uid = text(v, "UID") ?? "";
+    if (!byUid.has(uid)) byUid.set(uid, []);
+    byUid.get(uid)!.push(v);
+  }
+  return [...byUid.values()].map((group) => veventsToEvent(group, null, null)!);
+}
+
+function vevents(ics: string): Component[] {
+  return parseComponents(ics)
     .flatMap((c) => c.children)
     .filter((c) => c.type === "VEVENT");
+}
+
+function veventsToEvent(vevents: Component[], id: string | null, calendarId: string | null): JsEvent | null {
   const master = vevents.find((v) => !prop(v, "RECURRENCE-ID")) ?? vevents[0];
   if (!master) return null;
 
@@ -74,7 +96,7 @@ export function icalToEvent(text: string, id: string, calendarId: string): JsEve
   return {
     id,
     "@type": "Event",
-    calendarIds: { [calendarId]: true },
+    calendarIds: calendarId === null ? null : { [calendarId]: true },
     ...ev,
     recurrenceRule: rrule ? parseRRule(rrule.value, tz) : null,
     recurrenceOverrides: Object.keys(overrides).length ? overrides : null,
