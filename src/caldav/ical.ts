@@ -98,6 +98,13 @@ function veventsToEvent(vevents: Component[], id: string | null, calendarId: str
     for (const k of ["start", "duration", "timeZone", "title", "description", "locations", "status"]) {
       if (JSON.stringify(full[k]) !== JSON.stringify(ev[k])) patch[k] = full[k];
     }
+    // Bulwark derives an occurrence's utcStart / utcEnd from its original slot
+    // and prefers them over `start` for display, so a moved occurrence has to
+    // carry its own or it keeps showing at the old time.
+    if ("start" in patch || "duration" in patch || "timeZone" in patch) {
+      patch.utcStart = full.utcStart;
+      patch.utcEnd = full.utcEnd;
+    }
     overrides[inZone(d, tz)] = patch;
   }
 
