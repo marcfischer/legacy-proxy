@@ -16,7 +16,7 @@ import type { AccountRow, Store } from "../../state/store.js";
 import type { ImapPool } from "../../imap/pool.js";
 import { withMailbox } from "../../imap/client.js";
 import { decodeBlobId, decodeEmailId } from "../../mapping/ids.js";
-import { accountNotFound, JmapError } from "../errors.js";
+import { accountNotFound, JmapError, unsupportedFilter } from "../errors.js";
 
 export interface CalendarCtx {
   account: AccountRow;
@@ -104,8 +104,25 @@ interface EventFilter {
   inCalendars?: string[];
   after?: string;
   before?: string;
+  uid?: string;
   operator?: string;
   conditions?: EventFilter[];
+}
+
+const FILTER_KEYS = new Set(["inCalendar", "inCalendars", "after", "before", "uid", "operator", "conditions"]);
+
+// Answering a filter we can't evaluate with every event is worse than failing:
+// Bulwark looks up a series' master with { uid } and edits the first recurring
+// event it gets back, which truncated an unrelated series before uid was
+// supported here.
+function checkFilter(f: EventFilter | undefined): void {
+  if (!f) return;
+  const unknown = Object.keys(f).filter((k) => !FILTER_KEYS.has(k));
+  if (unknown.length) throw unsupportedFilter(`unsupported CalendarEvent filter: ${unknown.join(", ")}`);
+  for (const c of f.conditions ?? []) {
+    const extra = Object.keys(c).filter((k) => k !== "inCalendar");
+    if (extra.length) throw unsupportedFilter(`only inCalendar is supported inside conditions, got: ${extra.join(", ")}`);
+  }
 }
 
 /** Calendar ids named by an inCalendar / inCalendars / OR-of-inCalendar filter; null = all. */
@@ -127,9 +144,17 @@ async function queryAll(ctx: CalendarCtx, filter?: EventFilter, timeZone?: strin
     before: filter?.before ? localToUtc(filter.before.slice(0, 19), zone) : undefined,
   };
   const targets = cals.filter((c) => !wanted || wanted.has(encodeId(c.href)));
-  const perCal = await mapWithConcurrency(targets, 4, async (c) =>
-    (await client.queryEvents(c.href, range)).map((h) => encodeId(`${c.href}\n${h}`)),
-  );
+  const perCal = await mapWithConcurrency(targets, 4, async (c) => {
+    let hrefs = await client.queryEvents(c.href, range);
+    // CalDAV has a UID prop-filter, but servers are free to ignore text
+    // matches (mailbox.org does), so match on the bodies instead; they mostly
+    // come from the body cache.
+    if (filter?.uid) {
+      const res = await client.multiGetEvents(c.href, hrefs);
+      hrefs = res.filter((r) => icalToEvent(r.data, "", "")?.uid === filter.uid).map((r) => r.href);
+    }
+    return hrefs.map((h) => encodeId(`${c.href}\n${h}`));
+  });
   return { ids: perCal.flat(), state: state(cals) };
 }
 
@@ -138,6 +163,7 @@ export async function calendarEventQuery(
   ctx: CalendarCtx,
 ) {
   checkAccount(args.accountId, ctx);
+  checkFilter(args.filter);
   // We don't implement `sort`: ids come back in server order, and Bulwark
   // sorts the expanded occurrences itself anyway.
   const { ids, state: s } = await queryAll(ctx, args.filter, args.timeZone);
