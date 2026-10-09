@@ -93,6 +93,21 @@ it("lists calendars and reads events in a time range with separate DAV credentia
   expect(reports.length).toBe(before);
 });
 
+it("filters by uid and refuses filters it can't evaluate", async () => {
+  const provider = { caldav: { host: "dav.example", port: 443, secure: true, username: "dav-user", password: "dav-pw" } } as ProviderConfig;
+  const ctx: CalendarCtx = { account: { id: 1 } as AccountRow, provider, creds: { mech: "PLAIN", username: "mail", password: "x" } };
+  store.set("/cal/u/work/2.ics", { data: EVENT.replace("UID:u1", "UID:u2"), etag: `"9"` });
+
+  const q = await calendarEventQuery({ accountId: "1", filter: { uid: "u2" } }, ctx);
+  expect(q.ids).toHaveLength(1);
+  const [ev] = (await calendarEventGet({ accountId: "1", ids: q.ids }, ctx)).list;
+  expect(ev!.uid).toBe("u2");
+  expect((await calendarEventQuery({ accountId: "1", filter: { uid: "nope" } }, ctx)).ids).toEqual([]);
+
+  await expect(calendarEventQuery({ accountId: "1", filter: { title: "Lunch" } as never }, ctx)).rejects.toMatchObject({ type: "unsupportedFilter" });
+  await expect(calendarEventQuery({ accountId: "1", filter: { operator: "OR", conditions: [{ uid: "u1" }] } as never }, ctx)).rejects.toMatchObject({ type: "unsupportedFilter" });
+});
+
 it("creates, updates (incl. a single occurrence) and destroys events", async () => {
   const provider = { caldav: { host: "dav.example", port: 443, secure: true, username: "dav-user", password: "dav-pw" } } as ProviderConfig;
   const ctx: CalendarCtx = { account: { id: 1 } as AccountRow, provider, creds: { mech: "PLAIN", username: "mail", password: "x" } };
