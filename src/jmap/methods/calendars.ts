@@ -385,7 +385,14 @@ async function readBlob(
       // imapflow answers `{}` rather than null for an expunged message or part.
       if (!dl?.content) return null;
       const chunks: Buffer[] = [];
-      for await (const chunk of dl.content) chunks.push(chunk as Buffer);
+      try {
+        for await (const chunk of dl.content) chunks.push(chunk as Buffer);
+      } catch (e) {
+        // Same as the download route: a FETCH that broke off mid-literal
+        // leaves the connection unparseable, so drop it rather than pool it.
+        client.close();
+        throw e;
+      }
       return Buffer.concat(chunks);
     }),
   );

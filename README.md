@@ -64,7 +64,7 @@ JMAP method coverage:
 | AddressBook       | `get`, `changes`, `set` (extended MKCOL / PROPPATCH / DELETE via CardDAV) |
 | ContactCard       | `get`, `query`, `queryChanges`, `changes`, `set` (PUT / DELETE via CardDAV) |
 | Calendar          | `get` (via CalDAV; calendars can't be created or renamed yet)         |
-| CalendarEvent     | `get`, `query` (`inCalendar(s)`, `after` / `before`), `set` (PUT / DELETE via CalDAV) |
+| CalendarEvent     | `get`, `query` (`inCalendar(s)`, `after` / `before`, `uid`), `set` (PUT / DELETE via CalDAV), `parse` (uploads and mail parts) |
 | Quota             | `get` (stub returning empty list, so probing clients don't error)    |
 
 Capabilities advertised on the Session resource:
