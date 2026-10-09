@@ -276,12 +276,16 @@ export async function calendarEventSet(
   }
 
   for (const [id, patch] of Object.entries(args.update ?? {})) {
+    const parts = splitEventId(id);
+    // Ids we didn't mint include Bulwark's synthetic-id probe; answering
+    // invalidProperties (not notFound) tells it we don't take synthetic
+    // occurrence ids, so it keeps expanding series itself. Not logged: the
+    // probe runs on every calendar load.
+    if (!parts) {
+      notUpdated[id] = setError("invalidProperties", "not an event id");
+      continue;
+    }
     try {
-      const parts = splitEventId(id);
-      // Ids we didn't mint include Bulwark's synthetic-id probe; answering
-      // invalidProperties (not notFound) tells it we don't take synthetic
-      // occurrence ids, so it keeps expanding series itself.
-      if (!parts) throw new JmapError("invalidProperties", "not an event id");
       const calId = encodeId(parts.calHref);
       if (!calById.has(calId)) throw new JmapError("notFound", "no such calendar");
       const [res] = await client.fetchEvents(parts.calHref, [parts.href]);
