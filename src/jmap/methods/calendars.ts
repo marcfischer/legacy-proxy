@@ -1,17 +1,17 @@
 // JMAP for Calendars handlers backed by CalDAV (RFC 4791): Calendar/get and
-// CalendarEvent/get, /query and /set. Ids follow the
+// CalendarEvent/get, /query, /set and /parse. Ids follow the
 // contacts scheme - base64url of the collection href, and of
 // "collectionHref\nresourceHref" for events.
 
 import crypto from "node:crypto";
 import { Buffer } from "node:buffer";
 import { CalDavClient, type CalendarInfo } from "../../caldav/client.js";
-import { eventToIcal, icalToEvent, localToUtc, type JsEvent } from "../../caldav/ical.js";
+import { eventToIcal, icalToEvent, icalToEvents, localToUtc, type JsEvent } from "../../caldav/ical.js";
 import { applyPatch, errorFor, setError } from "./contacts.js";
 import { mapWithConcurrency } from "../../util/concurrency.js";
 import type { Credentials } from "../../auth/credentials.js";
 import type { ProviderConfig } from "../../util/config.js";
-import type { AccountRow } from "../../state/store.js";
+import type { AccountRow, Store } from "../../state/store.js";
 import { accountNotFound, JmapError } from "../errors.js";
 
 export interface CalendarCtx {
@@ -284,4 +284,30 @@ export async function calendarEventSet(
     notUpdated: orNull(notUpdated),
     notDestroyed: orNull(notDestroyed),
   };
+}
+
+// -- CalendarEvent/parse -----------------------------------------------------------
+
+// Bulwark's .ics import uploads the file and has it parsed here before
+// creating the events it picked with CalendarEvent/set. Parsing needs no
+// CalDAV, so like Email/parse this only reads uploaded blobs.
+export function calendarEventParse(
+  args: { accountId: string; blobIds: string[] },
+  ctx: { account: AccountRow; store: Store },
+) {
+  if (args.accountId !== String(ctx.account.id)) throw accountNotFound();
+  const parsed: Record<string, JsEvent[]> = {};
+  const notFound: string[] = [];
+  const notParsable: string[] = [];
+  for (const blobId of args.blobIds ?? []) {
+    const upload = blobId.startsWith("U") ? ctx.store.getUpload(blobId, ctx.account.id) : null;
+    if (!upload) {
+      notFound.push(blobId);
+      continue;
+    }
+    const events = icalToEvents(upload.body.toString("utf8"));
+    if (events.length) parsed[blobId] = events;
+    else notParsable.push(blobId);
+  }
+  return { accountId: args.accountId, parsed, notParsable, notFound };
 }
