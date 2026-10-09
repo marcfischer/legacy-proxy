@@ -12,6 +12,9 @@ import { mapWithConcurrency } from "../../util/concurrency.js";
 import type { Credentials } from "../../auth/credentials.js";
 import type { ProviderConfig } from "../../util/config.js";
 import type { AccountRow, Store } from "../../state/store.js";
+import type { ImapPool } from "../../imap/pool.js";
+import { withMailbox } from "../../imap/client.js";
+import { decodeBlobId, decodeEmailId } from "../../mapping/ids.js";
 import { accountNotFound, JmapError } from "../errors.js";
 
 export interface CalendarCtx {
@@ -288,26 +291,62 @@ export async function calendarEventSet(
 
 // -- CalendarEvent/parse -----------------------------------------------------------
 
-// Bulwark's .ics import uploads the file and has it parsed here before
-// creating the events it picked with CalendarEvent/set. Parsing needs no
-// CalDAV, so like Email/parse this only reads uploaded blobs.
-export function calendarEventParse(
+// Bulwark parses .ics files here in two places: its calendar import uploads
+// the file first, and the invitation banner passes the blobId of the mail's
+// text/calendar part. Parsing needs no CalDAV, only the blob's bytes.
+export async function calendarEventParse(
   args: { accountId: string; blobIds: string[] },
-  ctx: { account: AccountRow; store: Store },
+  ctx: { account: AccountRow; store: Store; pool: ImapPool },
 ) {
   if (args.accountId !== String(ctx.account.id)) throw accountNotFound();
   const parsed: Record<string, JsEvent[]> = {};
   const notFound: string[] = [];
   const notParsable: string[] = [];
   for (const blobId of args.blobIds ?? []) {
-    const upload = blobId.startsWith("U") ? ctx.store.getUpload(blobId, ctx.account.id) : null;
-    if (!upload) {
+    const body = await readBlob(blobId, ctx);
+    if (!body) {
       notFound.push(blobId);
       continue;
     }
-    const events = icalToEvents(upload.body.toString("utf8"));
+    const events = icalToEvents(body.toString("utf8"));
     if (events.length) parsed[blobId] = events;
     else notParsable.push(blobId);
   }
   return { accountId: args.accountId, parsed, notParsable, notFound };
+}
+
+// The same lookup the download route does: uploads from SQLite, mail parts
+// from the blob cache or else an IMAP fetch. Invitations are a few KB, so we
+// buffer instead of streaming, and leave caching to the download route.
+async function readBlob(
+  blobId: string,
+  ctx: { account: AccountRow; store: Store; pool: ImapPool },
+): Promise<Buffer | null> {
+  if (blobId.startsWith("U")) return ctx.store.getUpload(blobId, ctx.account.id)?.body ?? null;
+  const cached = ctx.store.getCachedBlob(blobId, ctx.account.id);
+  if (cached) return cached.body;
+
+  let part: { emailId: string; partId: string | null };
+  let email: { mailboxIdx: number; uid: number };
+  try {
+    part = decodeBlobId(blobId);
+    email = decodeEmailId(part.emailId);
+  } catch {
+    return null;
+  }
+  const mbox = ctx.store
+    .prep(`SELECT id,name FROM mailbox WHERE id = ? AND account_id = ?`)
+    .get(email.mailboxIdx, ctx.account.id) as { id: number; name: string } | undefined;
+  if (!mbox) return null;
+
+  return ctx.pool.withConnection(ctx.account, "interactive", (client) =>
+    withMailbox(client, mbox.name, async () => {
+      const dl = await client.download(`${email.uid}`, part.partId ?? undefined, { uid: true });
+      // imapflow answers `{}` rather than null for an expunged message or part.
+      if (!dl?.content) return null;
+      const chunks: Buffer[] = [];
+      for await (const chunk of dl.content) chunks.push(chunk as Buffer);
+      return Buffer.concat(chunks);
+    }),
+  );
 }
