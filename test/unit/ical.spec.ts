@@ -58,14 +58,14 @@ describe("icalToEvent", () => {
       },
       recurrenceOverrides: {
         "2026-10-12T10:00:00": { excluded: true },
-        "2026-10-19T10:00:00": { start: "2026-10-19T14:00:00" },
+        "2026-10-19T10:00:00": { start: "2026-10-19T14:00:00", utcStart: "2026-10-19T12:00:00Z", utcEnd: "2026-10-19T13:30:00Z" },
       },
       alerts: { a1: { trigger: { "@type": "OffsetTrigger", offset: "-PT15M", relativeTo: "start" } } },
     });
     const parts = Object.values(ev.participants as Record<string, { email: string; roles: object }>);
     expect(parts.map((p) => p.email)).toEqual(["marc@example.org", "bob@example.org"]);
-    // Override only carries what changed.
-    expect(Object.keys((ev.recurrenceOverrides as Record<string, object>)["2026-10-19T10:00:00"]!)).toEqual(["start"]);
+    // Override only carries what changed, plus its own UTC times once it moved.
+    expect(Object.keys((ev.recurrenceOverrides as Record<string, object>)["2026-10-19T10:00:00"]!)).toEqual(["start", "utcStart", "utcEnd"]);
   });
 
   it("maps an all-day event and skips VTODO-only resources", () => {
