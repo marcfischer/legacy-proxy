@@ -9,6 +9,7 @@ import { CalDavClient, type CalendarInfo } from "../../caldav/client.js";
 import { eventToIcal, icalToEvent, icalToEvents, localToUtc, type JsEvent } from "../../caldav/ical.js";
 import { applyPatch, errorFor, setError } from "./contacts.js";
 import { mapWithConcurrency } from "../../util/concurrency.js";
+import { log } from "../../util/log.js";
 import type { Credentials } from "../../auth/credentials.js";
 import type { ProviderConfig } from "../../util/config.js";
 import type { AccountRow, Store } from "../../state/store.js";
@@ -193,6 +194,16 @@ export async function calendarEventGet(args: { accountId: string; ids?: string[]
 
 type SetError = ReturnType<typeof setError>;
 
+// Per-item failures go back in notCreated / notUpdated / notDestroyed inside a
+// 200 response, so the request log never shows them. Log them here, with the
+// property names the client sent, since the browser is the only other place
+// they surface.
+function itemFailed(op: string, id: string, e: unknown, props?: string[]): SetError {
+  const err = errorFor(e);
+  log.warn({ op, id, ...err, ...(props ? { props } : {}) }, "CalendarEvent/set item failed");
+  return err;
+}
+
 // Server-set or derived properties; a client sending them back is ignored
 // rather than rejected.
 const EVENT_READ_ONLY = new Set(["id", "uid", "@type", "created", "updated", "utcStart", "utcEnd", "baseEventId", "isOrigin", "isDraft"]);
@@ -234,7 +245,7 @@ export async function calendarEventSet(
       await client.putEvent(href, eventToIcal(event));
       created[cid] = { id: encodeId(`${cal.href}\n${href}`), uid };
     } catch (e) {
-      notCreated[cid] = errorFor(e);
+      notCreated[cid] = itemFailed("create", cid, e, Object.keys(ev));
     }
   }
 
@@ -260,7 +271,7 @@ export async function calendarEventSet(
       await client.putEvent(parts.href, eventToIcal(current, res.data), res.etag);
       updated[id] = null;
     } catch (e) {
-      notUpdated[id] = errorFor(e);
+      notUpdated[id] = itemFailed("update", id, e, Object.keys(patch));
     }
   }
 
@@ -271,7 +282,7 @@ export async function calendarEventSet(
       await client.deleteEvent(parts.href);
       destroyed.push(id);
     } catch (e) {
-      notDestroyed[id] = errorFor(e);
+      notDestroyed[id] = itemFailed("destroy", id, e);
     }
   }
 
