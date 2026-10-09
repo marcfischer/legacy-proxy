@@ -118,11 +118,17 @@ it("creates, updates (incl. a single occurrence) and destroys events", async () 
     [id]: { "recurrenceOverrides/2026-10-12T09:00:00": { start: "2026-10-12T11:00:00" } },
   } }, ctx);
   expect(upd.updated).toEqual({ [id]: null });
+  // The server may bump an override's SEQUENCE past the master's; the next
+  // write must not take it back down.
+  const href = "/cal/u/work/standup@example.org.ics";
+  const stored = store.get(href)!;
+  store.set(href, { ...stored, data: stored.data.replace(/(RECURRENCE-ID[\s\S]*?)SEQUENCE:1/, "$1SEQUENCE:5") });
   await calendarEventSet({ accountId: "1", update: { [id]: { title: "Daily" } } }, ctx);
+  expect([...store.get(href)!.data.matchAll(/SEQUENCE:(\d+)/g)].map((m) => m[1])).toEqual(["6", "6"]);
   const [ev] = (await calendarEventGet({ accountId: "1", ids: [id] }, ctx)).list;
   expect(ev).toMatchObject({
     title: "Daily",
-    sequence: 2,
+    sequence: 6,
     recurrenceOverrides: { "2026-10-12T09:00:00": { start: "2026-10-12T11:00:00" } },
   });
 

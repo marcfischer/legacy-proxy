@@ -6,7 +6,7 @@
 import crypto from "node:crypto";
 import { Buffer } from "node:buffer";
 import { CalDavClient, type CalendarInfo } from "../../caldav/client.js";
-import { eventToIcal, icalToEvent, icalToEvents, localToUtc, type JsEvent } from "../../caldav/ical.js";
+import { eventToIcal, highestSequence, icalToEvent, icalToEvents, localToUtc, type JsEvent } from "../../caldav/ical.js";
 import { applyPatch, errorFor, setError } from "./contacts.js";
 import { mapWithConcurrency } from "../../util/concurrency.js";
 import { log } from "../../util/log.js";
@@ -267,7 +267,10 @@ export async function calendarEventSet(
         throw new JmapError("invalidProperties", "moving events between calendars is not supported");
       }
       applyPatch(current, p);
-      if (!("sequence" in p)) current.sequence = (Number(current.sequence) || 0) + 1;
+      // Overrides are written with the master's SEQUENCE, so bump past the
+      // highest one stored: writing an override back with a lower SEQUENCE
+      // than it has is rejected with 412.
+      if (!("sequence" in p)) current.sequence = Math.max(Number(current.sequence) || 0, highestSequence(res.data)) + 1;
       await client.putEvent(parts.href, eventToIcal(current, res.data), res.etag);
       updated[id] = null;
     } catch (e) {
