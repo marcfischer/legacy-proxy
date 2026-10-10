@@ -218,14 +218,16 @@ export async function emailSubmissionSet(
       });
       // The only record a send leaves on our side. Without it there is no way
       // to tell "never left the proxy" from "delivered, nobody answered".
+      // Addresses are personal data, so they are only logged on request.
       const sendLog = {
         emailId: payload.emailId,
-        mailFrom: env.from,
-        rcptTo: env.to,
         accepted: result.accepted.length,
-        rejected: result.rejected,
+        rejected: result.rejected.length,
         smtpResponse: result.response,
         messageId: result.messageId,
+        ...(process.env.LOG_SUBMISSION_ADDRESSES === "1"
+          ? { mailFrom: env.from, rcptTo: env.to, rejectedAddresses: result.rejected }
+          : {}),
       };
       if (result.rejected.length > 0) log.warn(sendLog, "submission: SMTP server rejected some recipients");
       else log.info(sendLog, "submission: accepted by SMTP server");
