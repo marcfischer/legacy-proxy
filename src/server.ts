@@ -14,14 +14,7 @@ import { buildSession } from "./jmap/session.js";
 import { KNOWN_CAPABILITIES } from "./jmap/capabilities.js";
 import { dispatch, type RequestEnvelope } from "./jmap/router.js";
 import { EventSourceHub } from "./jmap/eventsource.js";
-<<<<<<< HEAD
-import { openImap } from "./imap/client.js";
-import { imapErrorDetails } from "./imap/fetcher.js";
-||||||| 2b0d493
-import { openImap } from "./imap/client.js";
-=======
 import { imapErrorDetails, openImap } from "./imap/client.js";
->>>>>>> fix/imap-empty-bodies
 import { PushDispatcher } from "./push/dispatcher.js";
 import { PushIdleManager } from "./push/idle.js";
 
