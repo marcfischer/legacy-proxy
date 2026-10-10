@@ -7,6 +7,7 @@ import { selectBodies, structureToBodyParts, type EmailBodyPart } from "../mappi
 import { flagsToKeywords } from "../mapping/flags.js";
 import { encodeBlobId, encodeEmailId, encodeMailboxId } from "../mapping/ids.js";
 import { parseHeaderBlock, asMessageIds, computeThreadIdFromHeaders, type ParsedHeader } from "./headers.js";
+import { imapErrorDetails } from "./client.js";
 import { fetchByUid } from "./uids.js";
 import type { AccountRow, MailboxRow, Store, EmailCacheUpsert } from "../state/store.js";
 import { log } from "../util/log.js";
@@ -324,7 +325,12 @@ async function fetchBodyValuesBatched(
       }
     } catch (e) {
       // fall through: members without raw parts get isEncodingProblem below
+<<<<<<< HEAD
       log.warn({ uids: g.members.length, partIds: g.partIds, ...imapErrorDetails(e) }, "body part FETCH failed");
+||||||| 2b0d493
+=======
+      log.warn({ uids: g.members.map((m) => m.uid), partIds: g.partIds, ...imapErrorDetails(e) }, "body part FETCH failed");
+>>>>>>> fix/imap-empty-bodies
     }
     for (const m of g.members) {
       const bodyParts = rawByUid.get(m.uid);
@@ -428,7 +434,12 @@ async function fetchPreviewsBatched(
       }
     } catch (e) {
       // best-effort: leave preview empty (and uncached) for this group
+<<<<<<< HEAD
       log.warn({ partId, uids: group.length, ...imapErrorDetails(e) }, "preview FETCH failed");
+||||||| 2b0d493
+=======
+      log.warn({ partId, uids: group.map((t) => t.uid), ...imapErrorDetails(e) }, "preview FETCH failed");
+>>>>>>> fix/imap-empty-bodies
     }
   }
   return out;
