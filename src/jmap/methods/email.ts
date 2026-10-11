@@ -958,6 +958,9 @@ export async function emailSet(
       try { touchedMailboxes.add(decodeEmailId(res.id).mailboxIdx); } catch { /* opaque id */ }
     } catch (e) {
       notCreated[cid] = toSetError(e);
+      // Per-message failures reach the client only inside a 200 response, so
+      // nothing else on our side would record a draft that was never saved.
+      log.warn({ creationId: cid, ...notCreated[cid] }, "Email/set: message not stored");
     }
   }
 
@@ -1683,6 +1686,7 @@ export async function emailImport(
       created[cid] = await applyEmailImport(payload, ctx);
     } catch (e) {
       notCreated[cid] = toSetError(e);
+      log.warn({ creationId: cid, ...notCreated[cid] }, "Email/import: message not stored");
     }
   }
   if (Object.keys(created).length > 0) {
