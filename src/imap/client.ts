@@ -43,6 +43,26 @@ export async function withMailbox<T>(
   }
 }
 
+// A pooled connection that already has the mailbox selected hears about
+// messages appended on another connection only with its next command's
+// untagged EXISTS - and the pool skips its NOOP for recently used
+// connections. A UID FETCH for a message just stored elsewhere (a draft
+// imported and submitted in one request, or read back right after saving)
+// can therefore come back empty. Ask once more after a NOOP before treating
+// the message as gone.
+export async function fetchAfterNoop<T>(
+  client: ImapFlow,
+  where: { mailbox: string; uid: number },
+  fetch: () => Promise<T | null>,
+): Promise<T | null> {
+  const first = await fetch();
+  if (first != null) return first;
+  await client.noop();
+  const second = await fetch();
+  if (second != null) log.info(where, "imap: message only visible after NOOP");
+  return second;
+}
+
 // The server's side of a failed IMAP command. imapflow puts the tagged NO/BAD
 // text on the error object; without it the log only says "Command failed".
 export function imapErrorDetails(e: unknown): Record<string, unknown> {
