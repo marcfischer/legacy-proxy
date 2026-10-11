@@ -14,7 +14,7 @@ import { buildSession } from "./jmap/session.js";
 import { KNOWN_CAPABILITIES } from "./jmap/capabilities.js";
 import { dispatch, type RequestEnvelope } from "./jmap/router.js";
 import { EventSourceHub } from "./jmap/eventsource.js";
-import { imapErrorDetails, openImap } from "./imap/client.js";
+import { fetchAfterNoop, imapErrorDetails, openImap } from "./imap/client.js";
 import { PushDispatcher } from "./push/dispatcher.js";
 import { PushIdleManager } from "./push/idle.js";
 
@@ -248,14 +248,13 @@ app.get<{ Params: { accountId: string; blobId: string; type: string; name: strin
     };
 
     try {
-      const dl = await client.download(
-        `${emailParts.uid}`,
-        parsed.partId ?? undefined,
-        { uid: true },
-      );
       // imapflow answers `{}` rather than null when the FETCH came back
       // without the message or part (expunged, or the server could not
       // produce it), so check for the stream itself.
+      const dl = await fetchAfterNoop(client, { mailbox: mbox.name, uid: emailParts.uid }, async () => {
+        const d = await client.download(`${emailParts.uid}`, parsed.partId ?? undefined, { uid: true });
+        return d?.content ? d : null;
+      });
       if (!dl?.content) {
         release();
         log.warn(

@@ -4,7 +4,7 @@
 
 import type { ImapFlow } from "imapflow";
 import { Buffer } from "node:buffer";
-import { withMailbox } from "../imap/client.js";
+import { fetchAfterNoop, withMailbox } from "../imap/client.js";
 import type { ImapPool } from "../imap/pool.js";
 import { decodeBlobId, decodeEmailId } from "../mapping/ids.js";
 import type { AccountRow, Store } from "../state/store.js";
@@ -32,8 +32,11 @@ export async function readBlob(
 
   const fetch = (client: ImapFlow) =>
     withMailbox(client, mbox.name, async () => {
-      const dl = await client.download(`${email.uid}`, part.partId ?? undefined, { uid: true });
       // imapflow answers `{}` rather than null for an expunged message or part.
+      const dl = await fetchAfterNoop(client, { mailbox: mbox.name, uid: email.uid }, async () => {
+        const d = await client.download(`${email.uid}`, part.partId ?? undefined, { uid: true });
+        return d?.content ? d : null;
+      });
       if (!dl?.content) return null;
       const chunks: Buffer[] = [];
       try {

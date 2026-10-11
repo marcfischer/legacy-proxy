@@ -3,7 +3,7 @@ import { simpleParser } from "mailparser";
 import type { AccountRow, Store } from "../../state/store.js";
 import type { AppConfig } from "../../util/config.js";
 import { decodeEmailId } from "../../mapping/ids.js";
-import { withMailbox } from "../../imap/client.js";
+import { fetchAfterNoop, withMailbox } from "../../imap/client.js";
 import { resolveProvider } from "../../auth/providers.js";
 import { openCredentials } from "../../auth/credentials.js";
 import { submit } from "../../smtp/submit.js";
@@ -106,11 +106,12 @@ async function fetchRfc822(
     .get(parts.mailboxIdx, accountId) as { name: string } | undefined;
   if (!mbox) throw notFound();
 
-  const raw = await withMailbox(client, mbox.name, async () => {
-    const msg = await client.fetchOne(`${parts.uid}`, { uid: true, source: true }, { uid: true });
-    if (!msg || !msg.source) return null;
-    return msg.source;
-  });
+  const raw = await withMailbox(client, mbox.name, () =>
+    fetchAfterNoop(client, { mailbox: mbox.name, uid: parts.uid }, async () => {
+      const msg = await client.fetchOne(`${parts.uid}`, { uid: true, source: true }, { uid: true });
+      return msg && msg.source ? msg.source : null;
+    }),
+  );
   if (!raw) throw notFound();
   return { raw, mailboxName: mbox.name };
 }
