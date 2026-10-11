@@ -372,6 +372,10 @@ export async function emailSubmissionSet(
       implicitDestroyed.push(ok.emailId);
     } catch (e) {
       implicitNotDestroyed[ok.emailId] = toSetErrorLike(e);
+      log.warn(
+        { emailId: ok.emailId, err: (e as Error).message },
+        "submission: sent, but destroying the draft failed",
+      );
     }
   }
   for (const [refKey, patch] of Object.entries(args.onSuccessUpdateEmail ?? {})) {
@@ -395,6 +399,12 @@ export async function emailSubmissionSet(
       implicitUpdated[ok.emailId] = null;
     } catch (e) {
       implicitNotUpdated[ok.emailId] = toSetErrorLike(e);
+      // The mail is out but still sits among the drafts; sending it from
+      // there again would deliver it twice.
+      log.warn(
+        { emailId: ok.emailId, err: (e as Error).message },
+        "submission: sent, but updating the draft failed",
+      );
     }
   }
 
