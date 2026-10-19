@@ -239,11 +239,8 @@ async function rebuildThreadIndex(
       const scan = ctx.store.getMailboxScan(ctx.account.id, mailboxIdx);
       if (m.totalEmails === 0 && (scan?.messages ?? 0) === 0) continue;
       // Flags are mutable and not in the scan, so a flags build still reads them.
-      // Only Gmail's LIST-STATUS is trusted: on clustered Dovecot (mailbox.org)
-      // a pooled connection can report a folder's old UIDNEXT until it SELECTs
-      // or NOOPs, so skipping the SELECT hid new mail until the next login.
       const live = liveMailboxStatus(ctx.account.id, row.name);
-      if (!wantFlags && ctx.account.kind === "gmail" && live && scan && sameAsLastScan(live, scan)) continue;
+      if (!wantFlags && live && scan && sameAsLastScan(live, scan)) continue;
       try {
         await withMailbox(client, row.name, async () => {
           await syncMailboxScan(client, ctx.account, mailboxIdx, ctx.store);
