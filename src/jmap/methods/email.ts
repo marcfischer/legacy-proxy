@@ -138,11 +138,11 @@ function pruneSearchCache(): void {
   }
 }
 
-// UID SEARCH through the cache. A pooled connection that already has the
-// folder selected keeps its old view, HIGHESTMODSEQ included, until its next
-// command: on clustered Dovecot (mailbox.org) new mail stayed out of the list
-// until a fresh login brought a fresh connection. So a hit also needs the
-// Email state unchanged (IDLE bumps it on arrival), and a miss NOOPs first.
+// UID SEARCH through the search cache. A pooled connection that already has
+// the folder selected learns about new mail, and the new HIGHESTMODSEQ, only
+// with its next command, so the modseq guard alone kept serving the old list.
+// A hit therefore also needs the Email state unchanged (IDLE bumps it when
+// mail arrives), and a miss NOOPs before searching.
 async function cachedSearch(
   client: ImapFlow,
   store: Store,

@@ -29,10 +29,9 @@ export function isPrivateAddress(address: string): boolean {
 
 /**
  * Rejects a push URL whose host resolves to a non-public address. A name that
- * does not resolve passes: the POST fails on its own.
- * ponytail: checked right before each POST, not pinned into the connection, so
- * DNS rebinding between lookup and connect still slips through; pin via an
- * undici Agent `connect.lookup` if that matters.
+ * does not resolve passes: the POST fails on its own. The address is checked
+ * right before each POST but not pinned into the connection, so DNS rebinding
+ * between the lookup and the connect is not covered.
  */
 export async function assertPublicPushTarget(url: string): Promise<void> {
   if (process.env.PUSH_ALLOW_PRIVATE_URLS === "1") return;

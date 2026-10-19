@@ -1,4 +1,4 @@
-import { afterEach, expect, it } from "vitest";
+import { afterEach, beforeEach, expect, it } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -7,8 +7,14 @@ import { Store } from "../../src/state/store.js";
 import { emailQuery } from "../../src/jmap/methods/email.js";
 import { encodeMailboxId } from "../../src/mapping/ids.js";
 
-const dir = mkdtempSync(path.join(tmpdir(), "querystale-"));
-const store = new Store(dir);
+let dir: string;
+let store: Store;
+
+beforeEach(() => {
+  dir = mkdtempSync(path.join(tmpdir(), "querystale-"));
+  store = new Store(dir);
+});
+
 afterEach(() => {
   store.db.close();
   rmSync(dir, { recursive: true, force: true });
