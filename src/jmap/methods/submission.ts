@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { ImapFlow } from "imapflow";
 import { simpleParser } from "mailparser";
 import type { AccountRow, Store } from "../../state/store.js";
@@ -149,6 +150,26 @@ export function stripBccHeader(raw: Buffer): Buffer {
   return Buffer.from(kept.join("") + text.slice(headerEnd), "binary");
 }
 
+// Gmail keeps one message per Message-ID, and the copy its SMTP server files in
+// Sent shares the draft's id, so it lands on the draft instead: one message
+// that stays in Drafts, which Gmail will not let an IMAP client move out (#25).
+// Sending under a fresh id, as Thunderbird does, gives Gmail a message of its
+// own to file in Sent, and the draft can then simply be deleted.
+export function withFreshMessageId(raw: Buffer): Buffer {
+  const text = raw.toString("binary");
+  const m = /\r?\n\r?\n/.exec(text);
+  const headerEnd = m ? m.index : text.length;
+  const head = text.slice(0, headerEnd);
+  const old = /^message-id:[ \t]*([^\r\n]*(?:\r?\n[ \t][^\r\n]*)*)/im.exec(head);
+  if (!old) return raw;
+  const domain = /@([^>\s]+)>?\s*$/.exec(old[1]!)?.[1] ?? "localhost";
+  const replaced = `Message-ID: <${randomUUID()}@${domain}>`;
+  return Buffer.from(
+    head.slice(0, old.index) + replaced + head.slice(old.index + old[0].length) + text.slice(headerEnd),
+    "binary",
+  );
+}
+
 function asEmail(s: string | undefined | null): string | null {
   if (!s) return null;
   const t = s.trim();
@@ -208,6 +229,7 @@ export async function emailSubmissionSet(
   const creds = await openCredentials(ctx.cfg.vaultKey, ctx.account.vault);
 
   const oldState = stateString(ctx.store.getState(ctx.account.id, "submission"));
+  const gmail = ctx.account.kind === "gmail";
 
   const created: Record<string, SubmissionResult> = {};
   const notCreated: Record<string, SetError> = {};
@@ -220,12 +242,13 @@ export async function emailSubmissionSet(
       if (!payload.emailId) throw invalidArguments("emailId is required");
       const { raw } = await fetchRfc822(ctx.client, payload.emailId, ctx.store, ctx.account.id);
       const env = await resolveEnvelope(raw, payload.envelope ?? null);
+      const outgoing = gmail ? withFreshMessageId(stripBccHeader(raw)) : stripBccHeader(raw);
       const result = await submit({
         provider,
         creds,
         envelopeFrom: env.from,
         rcptTo: env.to,
-        raw: stripBccHeader(raw),
+        raw: outgoing,
       });
       // The only record a send leaves on our side. Without it there is no way
       // to tell "never left the proxy" from "delivered, nobody answered".
@@ -235,7 +258,7 @@ export async function emailSubmissionSet(
         accepted: result.accepted.length,
         rejected: result.rejected.length,
         smtpResponse: result.response,
-        messageId: messageIdOf(raw),
+        messageId: messageIdOf(outgoing),
         ...(process.env.LOG_SUBMISSION_ADDRESSES === "1"
           ? { mailFrom: env.from, rcptTo: env.to, rejectedAddresses: result.rejected }
           : {}),
@@ -319,6 +342,17 @@ export async function emailSubmissionSet(
     const ok = successByTempId.get(key);
     if (!ok) continue;
     if (skipDestroy.has(ok.emailId)) continue;
+    // Gmail's SMTP server has already filed the sent copy in Sent (see
+    // withFreshMessageId), so the draft goes instead of being filed again.
+    if (gmail) {
+      try {
+        await applyEmailUpdate(ok.emailId, { mailboxIds: {} }, ctx);
+        implicitDestroyed.push(ok.emailId);
+      } catch (e) {
+        implicitNotDestroyed[ok.emailId] = toSetErrorLike(e);
+      }
+      continue;
+    }
     try {
       await applyEmailUpdate(ok.emailId, patch as Record<string, unknown>, ctx);
       implicitUpdated[ok.emailId] = null;

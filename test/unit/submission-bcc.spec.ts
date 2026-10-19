@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { buildRfc822 } from "../../src/mapping/buildMime.js";
-import { messageIdOf, stripBccHeader } from "../../src/jmap/methods/submission.js";
+import { messageIdOf, stripBccHeader, withFreshMessageId } from "../../src/jmap/methods/submission.js";
 
 describe("Bcc handling", () => {
   it("keeps Bcc in the stored draft so the envelope can be derived from it", async () => {
@@ -43,5 +43,26 @@ describe("messageIdOf", () => {
     expect(messageIdOf(Buffer.from("From: a@example.org\r\nMessage-ID: <x@example.org>\r\n\r\nbody"))).toBe("<x@example.org>");
     expect(messageIdOf(Buffer.from("message-id:\r\n <y@example.org>\r\n\r\n"))).toBe("<y@example.org>");
     expect(messageIdOf(Buffer.from("From: a@example.org\r\n\r\nMessage-ID: <body@example.org>\r\n"))).toBeNull();
+  });
+});
+
+describe("withFreshMessageId", () => {
+  it("swaps the Message-ID for a new one on the same domain and leaves the rest alone", () => {
+    const raw = Buffer.from("From: a@gmail.com\r\nMessage-ID: <draft@gmail.com>\r\nSubject: hi\r\n\r\nMessage-ID: <body@x>\r\n");
+    const out = withFreshMessageId(raw).toString();
+    const id = messageIdOf(Buffer.from(out));
+    expect(id).toMatch(/^<[0-9a-f-]{36}@gmail\.com>$/);
+    expect(out.replace(id!, "<ID>")).toBe("From: a@gmail.com\r\nMessage-ID: <ID>\r\nSubject: hi\r\n\r\nMessage-ID: <body@x>\r\n");
+  });
+
+  it("replaces a folded Message-ID as a whole", () => {
+    const out = withFreshMessageId(Buffer.from("Message-ID:\r\n <draft@example.org>\r\nTo: b@example.org\r\n\r\nbody")).toString();
+    expect(out).not.toContain("draft@example.org");
+    expect(out).toMatch(/^Message-ID: <[0-9a-f-]{36}@example\.org>\r\nTo: b@example\.org\r\n\r\nbody$/);
+  });
+
+  it("leaves a message without Message-ID unchanged", () => {
+    const raw = Buffer.from("From: a@example.org\r\n\r\nbody");
+    expect(withFreshMessageId(raw).equals(raw)).toBe(true);
   });
 });

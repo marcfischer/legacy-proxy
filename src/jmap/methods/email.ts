@@ -428,7 +428,7 @@ async function postFilterByHasAttachment(
     const missingUids: number[] = [];
     for (const [uid, eid] of uidByEid) {
       const cached = cachedRows.get(uid);
-      if (cached?.bodystructure != null) {
+      if (cached?.bodystructure != null && cached.bodystructure !== "null") {
         try {
           const has = bodyStructureHasAttachment(JSON.parse(cached.bodystructure));
           if (has === want) keep.add(eid);
@@ -444,7 +444,8 @@ async function postFilterByHasAttachment(
         for await (const msg of fetchByUid(ctx.client, missingUids, { uid: true, bodyStructure: true })) {
           const uid = Number(msg.uid);
           const eid = uidByEid.get(uid);
-          if (!eid) continue;
+          // A FLAGS-only FETCH pushed mid-command has no structure to judge by.
+          if (!eid || !msg.bodyStructure) continue;
           const has = bodyStructureHasAttachment(msg.bodyStructure);
           if (has === want) keep.add(eid);
           upserts.push({
@@ -452,7 +453,7 @@ async function postFilterByHasAttachment(
             mailboxId: mailboxIdx,
             uidvalidity,
             uid,
-            bodystructure: JSON.stringify(msg.bodyStructure ?? null),
+            bodystructure: JSON.stringify(msg.bodyStructure),
           });
         }
         ctx.store.upsertEmailCacheRows(upserts);

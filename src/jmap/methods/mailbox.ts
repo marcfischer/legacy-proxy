@@ -53,6 +53,20 @@ interface ListCacheEntry {
 const listCache = new Map<number, ListCacheEntry>();
 const LIST_CACHE_HARD_TTL_MS = 30_000;
 
+// What the last LIST reported for each folder, by account and path. With
+// LIST-STATUS this costs nothing extra, and it lets the thread index tell a
+// folder that has not changed without SELECTing it.
+export interface LiveMailboxStatus {
+  uidValidity: number;
+  uidNext: number;
+  messages: number;
+}
+const liveStatus = new Map<number, Map<string, LiveMailboxStatus>>();
+
+export function liveMailboxStatus(accountId: number, path: string): LiveMailboxStatus | undefined {
+  return liveStatus.get(accountId)?.get(path);
+}
+
 export async function listMailboxes(
   client: ImapFlow,
   account: AccountRow,
@@ -67,7 +81,20 @@ export async function listMailboxes(
       if (fresh && stateMatch) return cached.list;
     }
   }
-  const list = await client.list({ statusQuery: { messages: true, unseen: true } });
+  const list = await client.list({
+    statusQuery: { messages: true, unseen: true, uidNext: true, uidValidity: true },
+  });
+  const statusByPath = new Map<string, LiveMailboxStatus>();
+  for (const it of list) {
+    const st = it.status;
+    if (st?.uidNext == null || st.uidValidity == null || st.messages == null) continue;
+    statusByPath.set(it.path, {
+      uidValidity: Number(st.uidValidity),
+      uidNext: Number(st.uidNext),
+      messages: st.messages,
+    });
+  }
+  liveStatus.set(account.id, statusByPath);
   const idByPath = new Map<string, number>();
 
   const upsert = store.prep(

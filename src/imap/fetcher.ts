@@ -448,13 +448,17 @@ export async function fetchEmailsBatch(
       (!needsFull || row.headers_full === 1)
     ) {
       try {
+        const envelope = JSON.parse(row.envelope) as EnvelopeLike | null;
+        const bodystructure = JSON.parse(row.bodystructure);
+        // Rows written before the guards above can hold the string "null".
+        if (!envelope || !bodystructure) throw new Error("incomplete cache row");
         raws.set(uid, {
           uid,
           flags: null,
           size: row.size ?? 0,
           internaldate: row.internaldate,
-          envelope: JSON.parse(row.envelope) as EnvelopeLike,
-          bodystructure: JSON.parse(row.bodystructure),
+          envelope,
+          bodystructure,
           headersRaw: Buffer.isBuffer(row.headers_raw) ? row.headers_raw : Buffer.from(row.headers_raw),
           headersFull: row.headers_full === 1,
           preview: row.preview,
@@ -470,7 +474,10 @@ export async function fetchEmailsBatch(
 
   if (missing.length > 0) {
     for await (const m of fetchByUid(client, missing, metaQuery(needsFull))) {
-      if (m.uid == null) continue;
+      // imapflow hands back every untagged FETCH that arrives during the
+      // command, including the FLAGS-only ones a server pushes when another
+      // session changes flags. Those carry no structure; keep the real answer.
+      if (m.uid == null || !m.bodyStructure || !m.envelope) continue;
       raws.set(m.uid, rawFromFetch(m, needsFull));
     }
   }
