@@ -209,6 +209,8 @@ export class PushDispatcher {
         },
         body: JSON.stringify(body),
         signal: controller.signal,
+        // A redirect would reach a target the address check never saw.
+        redirect: "error",
       });
       status = res.status;
       ok = res.ok;
