@@ -95,6 +95,8 @@ const FETCH_SORT_PROPS = new Set(["size", "from", "to", "subject", "sentAt", "ha
 interface SearchCacheEntry {
   uids: number[];
   modseq: number;
+  /** The account's Email state when cached: IDLE moves it on new mail. */
+  emailState: number;
   expiresAt: number;
 }
 const searchCache = new Map<string, SearchCacheEntry>();
@@ -134,6 +136,32 @@ function pruneSearchCache(): void {
     if (i++ >= drop) break;
     searchCache.delete(k);
   }
+}
+
+// UID SEARCH through the cache. A pooled connection that already has the
+// folder selected keeps its old view, HIGHESTMODSEQ included, until its next
+// command: on clustered Dovecot (mailbox.org) new mail stayed out of the list
+// until a fresh login brought a fresh connection. So a hit also needs the
+// Email state unchanged (IDLE bumps it on arrival), and a miss NOOPs first.
+async function cachedSearch(
+  client: ImapFlow,
+  store: Store,
+  accountId: number,
+  cacheKey: string,
+  modseq: number,
+  imapFilter: ReturnType<typeof compileFilter>,
+): Promise<number[]> {
+  const emailState = store.getState(accountId, "email");
+  const cached = searchCache.get(cacheKey);
+  if (cached && cached.modseq === modseq && cached.emailState === emailState && cached.expiresAt > Date.now()) {
+    return cached.uids;
+  }
+  await client.noop();
+  const searchResult = await client.search(imapFilter, { uid: true });
+  const uids = Array.isArray(searchResult) ? (searchResult as number[]) : [];
+  searchCache.set(cacheKey, { uids, modseq, emailState, expiresAt: Date.now() + SEARCH_CACHE_TTL_MS });
+  pruneSearchCache();
+  return uids;
 }
 
 // Drop every cache entry for an account. Called after we mutate emails
@@ -513,21 +541,7 @@ async function emailQuerySingleMailboxFull(
     const modseq = Number((status as { highestModseq?: bigint } | null)?.highestModseq ?? 0n);
 
     const cacheKey = searchCacheKey(ctx.account.id, m.mailboxIdx, uidvalidity, filter);
-    let uids: number[] | null = null;
-    const cached = searchCache.get(cacheKey);
-    if (cached && cached.modseq === modseq && cached.expiresAt > Date.now()) {
-      uids = cached.uids;
-    }
-    if (!uids) {
-      const searchResult = await ctx.client.search(imapFilter, { uid: true });
-      uids = Array.isArray(searchResult) ? (searchResult as number[]) : [];
-      searchCache.set(cacheKey, {
-        uids,
-        modseq,
-        expiresAt: Date.now() + SEARCH_CACHE_TTL_MS,
-      });
-      pruneSearchCache();
-    }
+    const uids = await cachedSearch(ctx.client, ctx.store, ctx.account.id, cacheKey, modseq, imapFilter);
     let orderedUids: number[];
     // Fast path: a pure receivedAt sort (or no sort) is UID order in a single
     // mailbox — SEARCH already returned UIDs ascending, so no FETCH at all.
@@ -645,21 +659,7 @@ async function emailQueryAccountWideFull(
       const modseq = Number((status as { highestModseq?: bigint } | null)?.highestModseq ?? 0n);
 
       const cacheKey = searchCacheKey(ctx.account.id, idx, uidvalidity, filter);
-      let uids: number[] | null = null;
-      const cached = searchCache.get(cacheKey);
-      if (cached && cached.modseq === modseq && cached.expiresAt > Date.now()) {
-        uids = cached.uids;
-      }
-      if (!uids) {
-        const searchResult = await client.search(imapFilter, { uid: true });
-        uids = Array.isArray(searchResult) ? (searchResult as number[]) : [];
-        searchCache.set(cacheKey, {
-          uids,
-          modseq,
-          expiresAt: Date.now() + SEARCH_CACHE_TTL_MS,
-        });
-        pruneSearchCache();
-      }
+      const uids = await cachedSearch(client, ctx.store, ctx.account.id, cacheKey, modseq, imapFilter);
       if (uids.length === 0) return;
 
       // Cross-folder merge needs receivedAt for every hit. Prefer the
