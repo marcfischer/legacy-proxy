@@ -284,7 +284,7 @@ export class Store {
 
   // A state move with no entries behind it (an IDLE arrival, a folder count
   // that moved). The log can no longer account for the period, so drop it:
-  // `*/changes` then answers cannotCalculateChanges instead of an empty diff
+  // `*/changes` then answers `cannotCalculateChanges` instead of an empty diff
   // that hides the change.
   bumpState(accountId: number, kind: string): number {
     this.changeLog.delete(`${accountId}|${kind}`);

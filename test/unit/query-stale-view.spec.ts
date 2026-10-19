@@ -31,16 +31,25 @@ it("lists mail that arrived while the pooled connection kept its old view", asyn
   const mailboxIdx = (store.prep(`SELECT id FROM mailbox WHERE name = 'INBOX'`).get() as { id: number }).id;
 
   const server = [1, 2];
-  let view = [...server];
+  let view: number[] = [];
+  let noops = 0;
   const client = {
-    mailbox: { path: "INBOX", uidValidity: 1n, highestModseq: 5n },
-    getMailboxLock: async () => ({ release: () => {} }),
+    mailbox: false as unknown,
+    getMailboxLock: async (p: string) => {
+      // SELECT gives a fresh view; an already selected folder keeps its old one.
+      if ((client.mailbox as { path?: string }).path !== p) {
+        client.mailbox = { path: p, uidValidity: 1n, highestModseq: 5n };
+        view = [...server];
+      }
+      return { release: () => {} };
+    },
     noop: async () => {
+      noops++;
       view = [...server];
     },
     search: async () => view,
-  } as unknown as ImapFlow;
-  const ctx = { account, client, store };
+  };
+  const ctx = { account, client: client as unknown as ImapFlow, store };
   const args = {
     accountId: String(account.id),
     filter: { inMailbox: encodeMailboxId({ accountIdx: account.id, mailboxIdx }) },
@@ -48,7 +57,9 @@ it("lists mail that arrived while the pooled connection kept its old view", asyn
   };
 
   expect((await emailQuery(args as never, ctx)).ids).toHaveLength(2);
+  expect(noops).toBe(0);
   server.push(3);
   store.bumpState(account.id, "email"); // IDLE: EXISTS grew
   expect((await emailQuery(args as never, ctx)).ids).toHaveLength(3);
+  expect(noops).toBe(1);
 });
