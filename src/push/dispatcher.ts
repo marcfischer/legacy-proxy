@@ -13,6 +13,7 @@ import { encodeCounterState, encodeEmailState } from "../state/states.js";
 import type { Store, AccountRow, PushSubscriptionRow } from "../state/store.js";
 import type { EventSourceHub } from "../jmap/eventsource.js";
 import { log } from "../util/log.js";
+import { assertPublicPushTarget } from "../util/pushTarget.js";
 
 // Internal store kinds → JMAP type names that share that counter.
 // `Email` and `Thread` both ride on the email counter because the IMAP
@@ -197,6 +198,7 @@ export class PushDispatcher {
     let status = 0;
     let ok = false;
     try {
+      await assertPublicPushTarget(sub.url);
       const res = await fetch(sub.url, {
         method: "POST",
         headers: {
