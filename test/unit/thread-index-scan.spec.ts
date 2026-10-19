@@ -73,6 +73,18 @@ describe("thread index scan", () => {
     expect(log.selects.sort()).toEqual(["INBOX", "[Gmail]/All Mail"]);
   });
 
+  it("still opens every folder on other servers, whose STATUS can lag", async () => {
+    const { client, log } = fakeServer({ INBOX: { messages: 3, uidNext: 10, uidValidity: 1n } });
+    const account = store.upsertAccount({ slug: "c", kind: "generic", host: "h", username: "u", vault: Buffer.from("v") });
+    const ctx = { account, client, store };
+
+    await buildThreadIndex(ctx);
+    log.selects = [];
+    store.bumpState(account.id, "email");
+    await buildThreadIndex(ctx);
+    expect(log.selects).toEqual(["INBOX"]);
+  });
+
   it("shares one build between requests that arrive together", async () => {
     const { client, log } = fakeServer({ INBOX: { messages: 1, uidNext: 2, uidValidity: 1n } });
     const account = store.upsertAccount({ slug: "b", kind: "generic", host: "h", username: "u", vault: Buffer.from("v") });
