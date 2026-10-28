@@ -307,13 +307,13 @@ interface SetResponse<Created> {
   notDestroyed: Record<string, SetError> | null;
 }
 
-function setError(type: string, description?: string, properties?: string[]): SetError {
+export function setError(type: string, description?: string, properties?: string[]): SetError {
   return { type, ...(description ? { description } : {}), ...(properties ? { properties } : {}) };
 }
 
-function errorFor(e: unknown, fallback = "serverFail"): SetError {
+export function errorFor(e: unknown, fallback = "serverFail"): SetError {
   if (e instanceof CardDavConflict) {
-    return setError("stateMismatch", "the resource changed on the CardDAV server; refetch and retry");
+    return setError("stateMismatch", "the resource changed on the DAV server; refetch and retry");
   }
   if (e instanceof JmapError) return setError(e.type, e.message);
   return setError(fallback, (e as Error)?.message);
