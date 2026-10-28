@@ -78,6 +78,17 @@ describe("icalToEvent", () => {
     });
     expect(icalToEvent("BEGIN:VCALENDAR\nBEGIN:VTODO\nUID:t\nEND:VTODO\nEND:VCALENDAR", "t", "c")).toBeNull();
   });
+
+  it("leaves floating time without a UTC instant", () => {
+    const floating = "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:f\nDTSTART:20261028T110000\nDTEND:20261028T120000\nEND:VEVENT\nEND:VCALENDAR";
+    expect(icalToEvent(floating, "e", "c")).toMatchObject({
+      start: "2026-10-28T11:00:00",
+      timeZone: null,
+      duration: "PT1H",
+      utcStart: null,
+      utcEnd: null,
+    });
+  });
 });
 
 describe("icalToEvents", () => {
