@@ -64,6 +64,13 @@ const MAX_BLOB = 50_000_000;
 /** Email properties Gmail's metadata format can answer (plus any `header:` projection). */
 /** How long an idle account keeps its label counters; any change moves the cache key first. */
 const LABELS_TTL = 10 * 60_000;
+/**
+ * Distinct labels {@link GmailMail.labelDetail} reads one by one in an account
+ * state before it reads them all at once through {@link GmailMail.labels}.
+ * A folder page or a badge needs one or two; a client counting its tags asks
+ * for one per tag, a hundred or more each round.
+ */
+const LABEL_DETAILS_BEFORE_BATCH = 8;
 const METADATA_PROPERTIES: ReadonlySet<string> = new Set([
   "id",
   "threadId",
@@ -102,6 +109,48 @@ const METADATA_PROPERTIES: ReadonlySet<string> = new Set([
  */
 const MESSAGE_TTL = 30 * 24 * 60 * 60_000;
 
+/**
+ * What `Thread/get` keeps of a thread: its message ids and dates. Caching the
+ * full thread meant decrypting every body, and writing every message back to
+ * the cache, on each folder page that asked for its conversation sizes.
+ */
+type ThreadMembers = { messages: { id: string; internalDate?: string }[] };
+function threadMembers(thread: { messages?: GmailMessage[] }): ThreadMembers {
+  return {
+    messages: (thread.messages ?? []).map((m) => ({
+      id: m.id,
+      internalDate: m.internalDate,
+    })),
+  };
+}
+
+/**
+ * `filter` with an `inMailboxOtherThan` that names only Trash and/or Spam
+ * taken out of its top-level AND; `undefined` when there is none.
+ */
+function withoutSpamTrash(filter: unknown): unknown {
+  if (!filter || typeof filter !== "object") return undefined;
+  const f = filter as Record<string, unknown>;
+  if (
+    f.operator !== "AND" ||
+    !Array.isArray(f.conditions) ||
+    Object.keys(f).length !== 2
+  )
+    return undefined;
+  const isBins = (c: unknown): boolean => {
+    if (!c || typeof c !== "object" || Object.keys(c).length !== 1) return false;
+    const ids = (c as Record<string, unknown>).inMailboxOtherThan;
+    return (
+      Array.isArray(ids) &&
+      ids.length > 0 &&
+      ids.every((id) => id === "l_TRASH" || id === "l_SPAM")
+    );
+  };
+  const rest = (f.conditions as unknown[]).filter((c) => !isBins(c));
+  if (rest.length === f.conditions.length || rest.length === 0) return undefined;
+  return rest.length === 1 ? rest[0] : { operator: "AND", conditions: rest };
+}
+
 export class GmailMail {
   readonly accountId: string;
   private composer: GmailCompose;
@@ -109,6 +158,8 @@ export class GmailMail {
   private queuedWrites = 0;
   private syncFlight?: Promise<void>;
   private flights = new Map<string, Promise<unknown>>();
+  /** Labels {@link labelDetail} was asked for in the current account state. */
+  private labelsAsked?: { state: string; ids: Set<string> };
   /** Messages Gmail delivered during the last push sync, for push fan-out. */
   private lastDelivered: string[] = [];
   /**
@@ -410,9 +461,30 @@ export class GmailMail {
    * single label's numbers; reaching them through {@link labels} costs one
    * Gmail call per label in the account (124 of them on a real Workspace
    * mailbox, ~7.5 s), which is what used to time out a push preview.
+   *
+   * A client counting its tags asks for many labels at once, though: one
+   * `labels.get` per tag, each its own round trip through the account's
+   * twelve slots, every time the state moves. Past
+   * {@link LABEL_DETAILS_BEFORE_BATCH} distinct labels in one state, the
+   * whole set is read through the batch endpoint instead - a hundred labels
+   * to a request - and every further label in that state is served from it.
+   * Concurrent reads of the same label share one request either way.
    */
   async labelDetail(id: string): Promise<GmailLabel | undefined> {
     const state = await this.state();
+    const all = this.store.cached<GmailLabel[]>(this.email, "labels:" + state);
+    if (all) {
+      const label = all.find((l) => l.id === id);
+      if (label) return label;
+    }
+    if (this.labelsAsked?.state !== state)
+      this.labelsAsked = { state, ids: new Set() };
+    this.labelsAsked.ids.add(id);
+    if (this.api.batch && this.labelsAsked.ids.size > LABEL_DETAILS_BEFORE_BATCH) {
+      const label = (await this.labels()).find((l) => l.id === id);
+      if (label) return label;
+      // Not in the listing the batch was built from: ask for it on its own.
+    }
     try {
       return await this.cached<GmailLabel>(
         `label:${id}:${state}`,
@@ -729,6 +801,52 @@ export class GmailMail {
       }
     }
   }
+  /**
+   * Fills the thread cache for `ids` with one batch read per hundred threads,
+   * so a folder page's conversation sizes cost one round trip to Google
+   * instead of fifty, four at a time. Best effort like {@link prefetch}.
+   */
+  private async prefetchThreads(ids: string[]): Promise<void> {
+    if (!this.api.batch || ids.length < 2) return;
+    const wanted = [
+      ...new Set(
+        ids.filter(
+          (id) =>
+            /^t_[A-Za-z0-9_-]{1,128}$/.test(id) &&
+            this.store.cached(this.email, `thread:v3:${id}`) === null,
+        ),
+      ),
+    ];
+    for (let offset = 0; offset < wanted.length; offset += MAX_BATCH) {
+      const page = wanted.slice(offset, offset + MAX_BATCH);
+      const revision = this.store.revision(this.email);
+      let answers: { status: number; data?: { messages?: GmailMessage[] } }[];
+      try {
+        answers = await this.api.batch<{ messages?: GmailMessage[] }>(
+          page.map((id) => ({
+            resource: `threads/${encodeURIComponent(id.slice(2))}`,
+            params: { format: "minimal" },
+          })),
+          10,
+        );
+      } catch (error) {
+        if (error instanceof JmapError && error.type === "serverUnavailable")
+          throw error;
+        return;
+      }
+      if (this.store.revision(this.email) !== revision) return;
+      for (const [index, id] of page.entries()) {
+        const answer = answers[index];
+        if (answer?.data)
+          this.store.cache(
+            this.email,
+            `thread:v3:${id}`,
+            threadMembers(answer.data),
+            MESSAGE_TTL,
+          );
+      }
+    }
+  }
   /** `metadata` omits bodies and parts: enough for list views, and much smaller to transfer and cache. */
   async message(
     id: string,
@@ -840,7 +958,12 @@ export class GmailMail {
     // is a folder query on that label: exact counters, no search. Clients
     // count every tag this way, often for tags another account defines; one
     // the account does not have matches nothing and needs no call at all.
-    const asLabel = await this.labelKeywordFilter(args.filter);
+    // Tag views and their badges leave Trash and Spam out (#1156 upstream).
+    // Gmail lists without them when asked, so that condition is a listing
+    // flag on the label path, not a reason to enumerate every tagged message.
+    const binless = withoutSpamTrash(args.filter);
+    const asLabel = await this.labelKeywordFilter(binless ?? args.filter);
+    const skipSpamTrash = binless !== undefined && asLabel != null;
     if (asLabel === null)
       return {
         accountId: this.accountId,
@@ -910,7 +1033,10 @@ export class GmailMail {
         // A folder page lists by label id: exact membership that matches the label's counts, with no
         // dependence on search syntax, label names or search-index lag.
         const listing: Record<string, string | string[]> = label
-          ? { labelIds: unreadIn ? [label.id, "UNREAD"] : label.id }
+          ? {
+              labelIds: unreadIn ? [label.id, "UNREAD"] : label.id,
+              ...(skipSpamTrash ? { includeSpamTrash: "false" } : {}),
+            }
           : { q: await q() };
         const count = Math.min(limit as number, MAX_QUERY);
         const wanted = Math.min(total, (pos as number) + count);
@@ -933,8 +1059,8 @@ export class GmailMail {
               MESSAGE_TTL,
               () =>
                 this.api.get("messages", 5, {
-                  ...listing,
                   includeSpamTrash: "true",
+                  ...listing,
                   maxResults: pageSize,
                   ...(cursor ? { pageToken: cursor } : {}),
                 }),
@@ -961,7 +1087,9 @@ export class GmailMail {
           // folder are different queries.
           queryState: hash([
             state,
-            label ? ["label", label.id, unreadIn ? "unread" : "all"] : search,
+            label
+              ? ["label", label.id, unreadIn ? "unread" : "all", skipSpamTrash]
+              : search,
           ]),
           canCalculateChanges: false,
           position: pos,
@@ -1105,17 +1233,30 @@ export class GmailMail {
       e instanceof JmapError
         ? e.toMethodError()
         : { type: "serverFail", description: "Gmail update failed" };
+    // Before and after: a read that starts while the write is in flight must
+    // not cache what it saw. A message write forgets that message and the
+    // listings; a label write can rename or empty a label on any message, so
+    // it still empties the account.
     const mutate = async <T>(
       resource: string,
       cost: number,
       method: "POST" | "PATCH" | "DELETE",
       data?: unknown,
+      message?: { id: string; threadId?: string },
     ): Promise<T> => {
-      this.store.invalidate(this.email);
+      const forget = () =>
+        message
+          ? this.store.forget(
+              this.email,
+              [message.id],
+              message.threadId ? [message.threadId] : [],
+            )
+          : this.store.invalidate(this.email);
+      forget();
       try {
         return await this.api.mutate!<T>(resource, cost, method, data);
       } finally {
-        this.store.invalidate(this.email);
+        forget();
       }
     };
     // Fresh label metadata validates membership and prevents editing system labels.
@@ -1185,6 +1326,7 @@ export class GmailMail {
                   5,
                   "POST",
                   delta,
+                  message,
                 )
               : message;
           const mapped = await mapMessage(
@@ -1577,31 +1719,25 @@ export class GmailMail {
         const list: Record<string, unknown>[] = [];
         const notFound: string[] = [];
         const state = await this.state();
+        await this.prefetchThreads(ids);
         const read = async (
           id: string,
         ): Promise<Record<string, unknown> | null> => {
           try {
-            const revision = this.store.revision(this.email);
-            const thread = await this.cached<{
-              id: string;
-              messages?: GmailMessage[];
-            }>(`thread:v2:${id}`, MESSAGE_TTL, () =>
-              this.api.get(
-                `threads/${encodeURIComponent(upstreamId(id, "t_"))}`,
-                10,
-                { format: "full" },
-              ),
+            const thread = await this.cached<ThreadMembers>(
+              `thread:v3:${id}`,
+              MESSAGE_TTL,
+              async () =>
+                threadMembers(
+                  await this.api.get<{ messages?: GmailMessage[] }>(
+                    `threads/${encodeURIComponent(upstreamId(id, "t_"))}`,
+                    10,
+                    { format: "minimal" },
+                  ),
+                ),
             );
-            if (this.store.revision(this.email) === revision)
-              for (const message of thread.messages ?? [])
-                this.store.cache(
-                  this.email,
-                  `message:v2:${message.id}`,
-                  message,
-                  MESSAGE_TTL,
-                );
-            const messages = [...(thread.messages ?? [])].sort(
-              (a, b) => Number(a.internalDate) - Number(b.internalDate),
+            const messages = [...thread.messages].sort(
+              (a, b) => Number(a.internalDate ?? 0) - Number(b.internalDate ?? 0),
             );
             return this.project(
               {

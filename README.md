@@ -683,6 +683,7 @@ URLs from `PUBLIC_URL` into `apiUrl`, `downloadUrl`, `uploadUrl`, and
 | `JMAP_DEBUG`               | unset                              | set to `1` to log every request/response shape       |
 | `LOG_SUBMISSION_ADDRESSES` | unset                              | set to `1` to log sender and recipients of each send |
 | `PUSH_ALLOW_PRIVATE_URLS`  | unset                              | set to `1` to allow push URLs on private networks    |
+| `PUSH_ALLOW_PRIVATE_URLS`  | unset                              | set to `1` to allow push URLs on private networks    |
 
 `providers.example.json` ships entries for Gmail and a generic
 `$IMAP_HOST` / `$SMTP_HOST` / `$SIEVE_HOST` / `$CARDDAV_HOST` / `$CALDAV_HOST`
@@ -692,9 +693,20 @@ vacation, reject with the underlying ManageSieve error. An optional `domains`
 array on a provider opts it into domain-based
 [provider selection](#provider-selection);
 `providers.two-servers.example.json` shows two providers wired up that way.
-When the DAV server uses a different login than the mail server, set
-`username` and `password` on the `carddav` / `caldav` entry (e.g.
-`"password": "$DAV_PASSWORD"`); otherwise the IMAP credentials are reused.
+CardDAV logs in with the user's mail credentials. When the DAV server wants
+a different login (mailbox.org app passwords, for example, are scoped to one
+service), set `username`, `password` and `forUser` on the `carddav` / `caldav`
+entry:
+
+```json
+"carddav": { "host": "dav.mailbox.org", "port": 443, "secure": true,
+             "username": "$DAV_USERNAME", "password": "$DAV_PASSWORD",
+             "forUser": "me@example.org" }
+```
+
+A provider's settings apply to everyone who logs in through it, so the DAV
+login is used only for the mail login named in `forUser`; everyone else keeps
+their own. Setting some of the three keys but not all is an error.
 An optional `caldav` entry (same shape as `carddav`, discovery default
 `/.well-known/caldav`) turns on calendars.
 

@@ -68,7 +68,7 @@ beforeEach(() => {
 afterEach(() => vi.unstubAllGlobals());
 
 it("lists calendars and reads events in a time range with separate DAV credentials", async () => {
-  const provider = { caldav: { host: "dav.example", port: 443, secure: true, username: "dav-user", password: "dav-pw" } } as ProviderConfig;
+  const provider = { caldav: { host: "dav.example", port: 443, secure: true, username: "dav-user", password: "dav-pw", forUser: "mail" } } as ProviderConfig;
   const ctx: CalendarCtx = { account: { id: 1 } as AccountRow, provider, creds: { mech: "PLAIN", username: "mail", password: "x" } };
 
   const cals = await calendarGet({ accountId: "1" }, ctx);
@@ -94,7 +94,7 @@ it("lists calendars and reads events in a time range with separate DAV credentia
 });
 
 it("filters by uid and refuses filters it can't evaluate", async () => {
-  const provider = { caldav: { host: "dav.example", port: 443, secure: true, username: "dav-user", password: "dav-pw" } } as ProviderConfig;
+  const provider = { caldav: { host: "dav.example", port: 443, secure: true, username: "dav-user", password: "dav-pw", forUser: "mail" } } as ProviderConfig;
   const ctx: CalendarCtx = { account: { id: 1 } as AccountRow, provider, creds: { mech: "PLAIN", username: "mail", password: "x" } };
   store.set("/cal/u/work/2.ics", { data: EVENT.replace("UID:u1", "UID:u2"), etag: `"9"` });
 
@@ -109,7 +109,7 @@ it("filters by uid and refuses filters it can't evaluate", async () => {
 });
 
 it("creates, updates (incl. a single occurrence) and destroys events", async () => {
-  const provider = { caldav: { host: "dav.example", port: 443, secure: true, username: "dav-user", password: "dav-pw" } } as ProviderConfig;
+  const provider = { caldav: { host: "dav.example", port: 443, secure: true, username: "dav-user", password: "dav-pw", forUser: "mail" } } as ProviderConfig;
   const ctx: CalendarCtx = { account: { id: 1 } as AccountRow, provider, creds: { mech: "PLAIN", username: "mail", password: "x" } };
   const calId = (await calendarGet({ accountId: "1" }, ctx)).list[0]!.id;
 

@@ -59,6 +59,7 @@ function dav(d: DavConfig | null | undefined): DavConfig | null {
     principalPath: opt(d.principalPath),
     username: opt(d.username),
     password: opt(d.password),
+    forUser: opt(d.forUser),
   };
 }
 

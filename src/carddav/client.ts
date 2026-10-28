@@ -26,13 +26,19 @@ export interface CardDavOpts {
   caldav?: boolean;
 }
 
-/** Client options for a provider's DAV entry: its own login when set, else the mail login. */
+/**
+ * Client options for a provider's DAV entry. Provider settings apply to
+ * everyone who logs in through that provider, so a separate DAV login is
+ * only used for the mail login it names in `forUser`; everyone else, and
+ * every provider without one, gets the mail credentials.
+ */
 export function davOptions(cfg: DavConfig, mailCreds: Credentials): CardDavOpts {
-  const { username, password, ...rest } = cfg;
-  // An unset $DAV_PASSWORD interpolates to "", which would otherwise fall
-  // back to the mail login without a word.
-  if (!username !== !password) throw new Error("DAV username and password must be set together");
-  return { ...rest, creds: username && password ? { mech: "PLAIN", username, password } : mailCreds };
+  const { username, password, forUser, ...rest } = cfg;
+  if (!username && !password && !forUser) return { ...rest, creds: mailCreds };
+  // Also catches an unset $DAV_PASSWORD, which interpolates to "".
+  if (!username || !password || !forUser) throw new Error("DAV username, password and forUser must be set together");
+  const mine = forUser.toLowerCase() === mailCreds.username.toLowerCase();
+  return { ...rest, creds: mine ? { mech: "PLAIN", username, password } : mailCreds };
 }
 
 export interface AddressBookInfo {

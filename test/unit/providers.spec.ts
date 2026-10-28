@@ -69,17 +69,21 @@ describe("DAV credentials", () => {
     expect(resolveProvider(c).carddav).toMatchObject({ username: "dav-user", password: "s3cret" });
   });
 
-  it("uses the DAV login when set and the mail login otherwise", () => {
-    const mail = { mech: "PLAIN", username: "me@example", password: "mail" } as const;
-    const dav = { host: "dav.example", port: 443 };
-    expect(davOptions({ ...dav, username: "dav-user", password: "pw" }, mail).creds).toEqual({ mech: "PLAIN", username: "dav-user", password: "pw" });
+  const mail = { mech: "PLAIN", username: "Me@Example.org", password: "mail" } as const;
+  const dav = { host: "dav.example", port: 443 };
+
+  it("uses the DAV login only for the mail login it names", () => {
+    const cfg = { ...dav, username: "dav-user", password: "pw", forUser: "me@example.org" };
+    expect(davOptions(cfg, mail).creds).toEqual({ mech: "PLAIN", username: "dav-user", password: "pw" });
+    expect(davOptions(cfg, { ...mail, username: "someone@example.org" }).creds).toEqual({ ...mail, username: "someone@example.org" });
     expect(davOptions(dav, mail).creds).toBe(mail);
   });
 
-  it("refuses a DAV login whose password interpolated to nothing", () => {
+  it("refuses a DAV login without forUser, or whose password interpolated to nothing", () => {
+    expect(() => davOptions({ ...dav, username: "dav-user", password: "pw" }, mail)).toThrow(/set together/);
     delete process.env.TEST_DAV_UNSET;
-    const p = { ...provider(), caldav: { host: "dav.example", port: 443, username: "dav-user", password: "$TEST_DAV_UNSET" } };
+    const p = { ...provider(), carddav: { ...dav, username: "dav-user", password: "$TEST_DAV_UNSET", forUser: "me@example.org" } };
     const c = { defaultProvider: "x", providers: { x: p } } as unknown as AppConfig;
-    expect(() => davOptions(resolveProvider(c).caldav!, { mech: "PLAIN", username: "me", password: "x" })).toThrow(/set together/);
+    expect(() => davOptions(resolveProvider(c).carddav!, mail)).toThrow(/set together/);
   });
 });

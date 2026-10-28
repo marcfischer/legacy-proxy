@@ -7,9 +7,13 @@ export interface DavConfig {
   secure?: boolean;
   basePath?: string;
   principalPath?: string;
-  /** DAV login when it differs from the mail login; falls back to the IMAP credentials. */
+  /**
+   * DAV login for the one mail login named in `forUser`, when it differs
+   * from the mail login. Everyone else keeps their IMAP credentials.
+   */
   username?: string;
   password?: string;
+  forUser?: string;
 }
 
 export interface ProviderConfig {
