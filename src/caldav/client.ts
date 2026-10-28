@@ -1,6 +1,7 @@
-// Minimal read-only CalDAV client (RFC 4791). Discovery, auth and transport are
+// Minimal CalDAV client (RFC 4791). Discovery, auth and transport are
 // the CardDAV client's (same WebDAV underneath); this adds the calendar
-// collection listing and the two REPORTs JMAP for Calendars needs.
+// collection listing, the two REPORTs JMAP for Calendars needs, and event
+// PUT / DELETE.
 
 import {
   CardDavClient, cachedBody, extractHref, freshEntry, hasResourceType, rememberVCard, splitResponses, textOf, type CardDavOpts,

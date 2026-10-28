@@ -65,6 +65,7 @@ JMAP method coverage:
 | ContactCard       | `get`, `query`, `queryChanges`, `changes`, `set` (PUT / DELETE via CardDAV) |
 | Calendar          | `get` (via CalDAV; calendars can't be created or renamed yet)         |
 | CalendarEvent     | `get`, `query` (`inCalendar(s)`, `after` / `before`, `uid`), `set` (PUT / DELETE via CalDAV), `parse` (uploads and mail parts) |
+| CalendarEventNotification | `query`, `get` (always empty: CalDAV has no notification inbox) |
 | Quota             | `get` (stub returning empty list, so probing clients don't error)    |
 
 Capabilities advertised on the Session resource:
@@ -684,11 +685,12 @@ URLs from `PUBLIC_URL` into `apiUrl`, `downloadUrl`, `uploadUrl`, and
 | `PUSH_ALLOW_PRIVATE_URLS`  | unset                              | set to `1` to allow push URLs on private networks    |
 
 `providers.example.json` ships entries for Gmail and a generic
-`$IMAP_HOST` / `$SMTP_HOST` / `$SIEVE_HOST` / `$CARDDAV_HOST` template.
-A `null` for any of `sieve` or `carddav` is allowed; the corresponding JMAP
-methods will then either return empty results or, for vacation, reject with
-the underlying ManageSieve error. An optional `domains` array on a provider
-opts it into domain-based [provider selection](#provider-selection);
+`$IMAP_HOST` / `$SMTP_HOST` / `$SIEVE_HOST` / `$CARDDAV_HOST` / `$CALDAV_HOST`
+template. A `null` for any of `sieve`, `carddav` or `caldav` is allowed; the
+corresponding JMAP methods will then either return empty results or, for
+vacation, reject with the underlying ManageSieve error. An optional `domains`
+array on a provider opts it into domain-based
+[provider selection](#provider-selection);
 `providers.two-servers.example.json` shows two providers wired up that way.
 When the DAV server uses a different login than the mail server, set
 `username` and `password` on the `carddav` / `caldav` entry (e.g.

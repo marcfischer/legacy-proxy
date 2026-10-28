@@ -12,6 +12,7 @@
 
 import { Buffer } from "node:buffer";
 import type { Credentials } from "../auth/credentials.js";
+import type { DavConfig } from "../util/config.js";
 import { log } from "../util/log.js";
 
 export interface CardDavOpts {
@@ -23,6 +24,15 @@ export interface CardDavOpts {
   creds: Credentials;
   /** Discover calendar-home-set (RFC 4791) instead of addressbook-home-set. */
   caldav?: boolean;
+}
+
+/** Client options for a provider's DAV entry: its own login when set, else the mail login. */
+export function davOptions(cfg: DavConfig, mailCreds: Credentials): CardDavOpts {
+  const { username, password, ...rest } = cfg;
+  // An unset $DAV_PASSWORD interpolates to "", which would otherwise fall
+  // back to the mail login without a word.
+  if (!username !== !password) throw new Error("DAV username and password must be set together");
+  return { ...rest, creds: username && password ? { mech: "PLAIN", username, password } : mailCreds };
 }
 
 export interface AddressBookInfo {

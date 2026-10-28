@@ -40,7 +40,16 @@ import {
   contactCardQueryChanges,
   contactsAvailable,
 } from "../jmap/methods/contacts.js";
-import { calendarGet, calendarEventGet, calendarEventParse, calendarEventQuery, calendarEventSet, calendarsAvailable } from "../jmap/methods/calendars.js";
+import {
+  calendarGet,
+  calendarEventGet,
+  calendarEventNotificationGet,
+  calendarEventNotificationQuery,
+  calendarEventParse,
+  calendarEventQuery,
+  calendarEventSet,
+  calendarsAvailable,
+} from "../jmap/methods/calendars.js";
 import { threadGet, threadChanges } from "../jmap/methods/threads.js";
 import { pushSubscriptionGet, pushSubscriptionSet } from "../jmap/methods/push.js";
 import { resolveProvider } from "../auth/providers.js";
@@ -182,6 +191,8 @@ function makeMethodTable(): Record<string, Handler> {
     },
     "CalendarEvent/parse": async (a, c) =>
       calendarEventParse(a as never, { account: c.account, store: c.store, pool: c.pool }),
+    "CalendarEventNotification/query": async (a, c) => calendarEventNotificationQuery(a as never, c.account),
+    "CalendarEventNotification/get": async (a, c) => calendarEventNotificationGet(a as never, c.account),
     "Mailbox/get": async (a, c) =>
       c.pool.withConnection(c.account, "interactive", (client) =>
         mailboxGet(a as never, { account: c.account, client, store: c.store }),

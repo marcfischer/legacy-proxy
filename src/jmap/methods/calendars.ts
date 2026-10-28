@@ -6,6 +6,7 @@
 import crypto from "node:crypto";
 import { Buffer } from "node:buffer";
 import { CalDavClient, type CalendarInfo } from "../../caldav/client.js";
+import { davOptions } from "../../carddav/client.js";
 import { eventToIcal, highestSequence, icalToEvent, icalToEvents, localToUtc, type JsEvent } from "../../caldav/ical.js";
 import { applyPatch, errorFor, setError } from "./contacts.js";
 import { mapWithConcurrency } from "../../util/concurrency.js";
@@ -43,9 +44,7 @@ export function calendarsAvailable(provider: ProviderConfig): boolean {
 
 function makeClient(ctx: CalendarCtx): CalDavClient {
   if (!ctx.provider.caldav) throw new JmapError("forbidden", "Calendars are not configured for this provider");
-  const { username, password, ...cfg } = ctx.provider.caldav;
-  const creds: Credentials = username && password ? { mech: "PLAIN", username, password } : ctx.creds;
-  return new CalDavClient({ ...cfg, creds });
+  return new CalDavClient(davOptions(ctx.provider.caldav, ctx.creds));
 }
 
 const encodeId = (s: string) => Buffer.from(s, "utf8").toString("base64url");
@@ -331,6 +330,20 @@ export async function calendarEventSet(
     notUpdated: orNull(notUpdated),
     notDestroyed: orNull(notDestroyed),
   };
+}
+
+// -- CalendarEventNotification/query, /get ----------------------------------------
+
+// CalDAV has no notification inbox. Bulwark polls these on every login and
+// logs an error when the methods are missing, so answer with an empty one.
+export function calendarEventNotificationQuery(args: { accountId: string }, account: AccountRow) {
+  if (args.accountId !== String(account.id)) throw accountNotFound();
+  return { accountId: args.accountId, queryState: "0", canCalculateChanges: false, position: 0, total: 0, ids: [] };
+}
+
+export function calendarEventNotificationGet(args: { accountId: string; ids?: string[] | null }, account: AccountRow) {
+  if (args.accountId !== String(account.id)) throw accountNotFound();
+  return { accountId: args.accountId, state: "0", list: [], notFound: args.ids ?? [] };
 }
 
 // -- CalendarEvent/parse -----------------------------------------------------------

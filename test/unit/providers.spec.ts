@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { providerForEmail, resolveProvider, resolveProviderName } from "../../src/auth/providers.js";
+import { davOptions } from "../../src/carddav/client.js";
 import type { AppConfig, ProviderConfig } from "../../src/util/config.js";
 
 function provider(domains?: string[]): ProviderConfig {
@@ -60,11 +61,25 @@ describe("resolveProviderName", () => {
   });
 });
 
-describe("resolveProvider carddav credentials", () => {
+describe("DAV credentials", () => {
   it("interpolates a separate DAV login from the environment", () => {
     process.env.TEST_DAV_PASSWORD = "s3cret";
     const p = { ...provider(), carddav: { host: "dav.example", port: 443, username: "dav-user", password: "$TEST_DAV_PASSWORD" } };
     const c = { defaultProvider: "x", providers: { x: p } } as unknown as AppConfig;
     expect(resolveProvider(c).carddav).toMatchObject({ username: "dav-user", password: "s3cret" });
+  });
+
+  it("uses the DAV login when set and the mail login otherwise", () => {
+    const mail = { mech: "PLAIN", username: "me@example", password: "mail" } as const;
+    const dav = { host: "dav.example", port: 443 };
+    expect(davOptions({ ...dav, username: "dav-user", password: "pw" }, mail).creds).toEqual({ mech: "PLAIN", username: "dav-user", password: "pw" });
+    expect(davOptions(dav, mail).creds).toBe(mail);
+  });
+
+  it("refuses a DAV login whose password interpolated to nothing", () => {
+    delete process.env.TEST_DAV_UNSET;
+    const p = { ...provider(), caldav: { host: "dav.example", port: 443, username: "dav-user", password: "$TEST_DAV_UNSET" } };
+    const c = { defaultProvider: "x", providers: { x: p } } as unknown as AppConfig;
+    expect(() => davOptions(resolveProvider(c).caldav!, { mech: "PLAIN", username: "me", password: "x" })).toThrow(/set together/);
   });
 });
