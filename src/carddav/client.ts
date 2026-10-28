@@ -12,6 +12,7 @@
 
 import { Buffer } from "node:buffer";
 import type { Credentials } from "../auth/credentials.js";
+import type { DavConfig } from "../util/config.js";
 import { log } from "../util/log.js";
 
 export interface CardDavOpts {
@@ -21,6 +22,17 @@ export interface CardDavOpts {
   basePath?: string;        // e.g. "/dav" - root of the DAV namespace
   principalPath?: string;   // override discovery, e.g. "/dav/addressbook/user@x.io/"
   creds: Credentials;
+  /** Discover calendar-home-set (RFC 4791) instead of addressbook-home-set. */
+  caldav?: boolean;
+}
+
+/** Client options for a provider's DAV entry: its own login when set, else the mail login. */
+export function davOptions(cfg: DavConfig, mailCreds: Credentials): CardDavOpts {
+  const { username, password, ...rest } = cfg;
+  // An unset $DAV_PASSWORD interpolates to "", which would otherwise fall
+  // back to the mail login without a word.
+  if (!username !== !password) throw new Error("DAV username and password must be set together");
+  return { ...rest, creds: username && password ? { mech: "PLAIN", username, password } : mailCreds };
 }
 
 export interface AddressBookInfo {
@@ -92,7 +104,12 @@ const RESOURCE_LIST_TTL_MS = 15_000;
 const vcardCache = new Map<string, string>();
 const VCARD_CACHE_MAX = 5_000;
 
-function rememberVCard(key: string, data: string): void {
+// Also holds CalDAV iCalendar bodies (their keys carry the "|cal" identity).
+export function cachedBody(key: string): string | undefined {
+  return vcardCache.get(key);
+}
+
+export function rememberVCard(key: string, data: string): void {
   // Re-insert so a re-read moves the entry to the young end.
   vcardCache.delete(key);
   vcardCache.set(key, data);
@@ -121,7 +138,7 @@ export function resetCardDavCaches(): void {
   vcardCache.clear();
 }
 
-function freshEntry<T extends { at: number }>(entry: T | undefined, ttl: number): T | null {
+export function freshEntry<T extends { at: number }>(entry: T | undefined, ttl: number): T | null {
   if (!entry) return null;
   if (Date.now() - entry.at >= ttl) return null;
   return entry;
@@ -132,14 +149,14 @@ export class CardDavClient {
   private readonly origin: string;
   private readonly authHeader: string;
   /** Cache identity: same server, same user => same discovery + book list. */
-  private readonly cacheKey: string;
+  protected readonly cacheKey: string;
 
   constructor(opts: CardDavOpts) {
     this.opts = opts;
     const proto = opts.secure ? "https" : "http";
     this.origin = `${proto}://${opts.host}:${opts.port}`;
     this.authHeader = buildAuth(opts.creds);
-    this.cacheKey = `${this.origin}|${opts.creds.username}|${opts.basePath ?? ""}|${opts.principalPath ?? ""}`;
+    this.cacheKey = `${this.origin}|${opts.creds.username}|${opts.basePath ?? ""}|${opts.principalPath ?? ""}${opts.caldav ? "|cal" : ""}`;
   }
 
   /** Find the principal URL via /.well-known/carddav (RFC 6764 §6). */
@@ -149,7 +166,7 @@ export class CardDavClient {
     const cached = freshEntry(discoveryCache.get(this.cacheKey), DISCOVERY_TTL_MS);
     if (cached?.principal) return cached.principal;
 
-    const start = this.opts.basePath ?? "/.well-known/carddav";
+    const start = this.opts.basePath ?? (this.opts.caldav ? "/.well-known/caldav" : "/.well-known/carddav");
     // 1. follow redirects from .well-known to the DAV root.
     const root = await this.followToCollection(start);
 
@@ -168,10 +185,11 @@ export class CardDavClient {
     if (cached?.home) return cached.home;
 
     const principal = await this.discoverPrincipal();
-    const homeXml = await this.propfind(principal, 0, [
-      "urn:ietf:params:xml:ns:carddav addressbook-home-set",
-    ]);
-    const found = pickHref(homeXml, "addressbook-home-set") ?? principal;
+    const homeSet = this.opts.caldav
+      ? "urn:ietf:params:xml:ns:caldav calendar-home-set"
+      : "urn:ietf:params:xml:ns:carddav addressbook-home-set";
+    const homeXml = await this.propfind(principal, 0, [homeSet]);
+    const found = pickHref(homeXml, splitProp(homeSet)[1]) ?? principal;
     const home = found.endsWith("/") ? found : found + "/";
     this.rememberDiscovery({ home });
     return home;
@@ -302,9 +320,9 @@ export class CardDavClient {
   async putResource(
     href: string,
     vcard: string,
-    opts: { ifMatch?: string | null } = {},
+    opts: { ifMatch?: string | null; contentType?: string } = {},
   ): Promise<{ etag: string | null }> {
-    const headers: Record<string, string> = { "Content-Type": "text/vcard; charset=utf-8" };
+    const headers: Record<string, string> = { "Content-Type": opts.contentType ?? "text/vcard; charset=utf-8" };
     if (opts.ifMatch) headers["If-Match"] = opts.ifMatch;
     else headers["If-None-Match"] = "*";
     const res = await this.raw("PUT", href, vcard, headers);
@@ -428,7 +446,7 @@ export class CardDavClient {
     throw new Error("CardDAV: too many redirects in discovery");
   }
 
-  private async propfind(path: string, depth: 0 | 1, props: string[]): Promise<string> {
+  protected async propfind(path: string, depth: 0 | 1, props: string[]): Promise<string> {
     const ns = collectNamespaces(props);
     const propXml = props.map((p) => {
       const [nsUri, name] = splitProp(p);
@@ -444,7 +462,7 @@ export class CardDavClient {
     return this.request("PROPFIND", path, body, { Depth: String(depth) });
   }
 
-  private async request(
+  protected async request(
     method: string,
     path: string,
     body: string,
@@ -532,6 +550,7 @@ function collectNamespaces(props: string[]): { prefix(uri: string): string; decl
   const map = new Map<string, string>([
     ["DAV:", "D"],
     ["urn:ietf:params:xml:ns:carddav", "C"],
+    ["urn:ietf:params:xml:ns:caldav", "CAL"],
     ["http://calendarserver.org/ns/", "CS"],
   ]);
   for (const p of props) {
@@ -586,11 +605,11 @@ export function textOf(chunk: string, localName: string): string | null {
 export function hasResourceType(chunk: string, localName: string): boolean {
   const block = textOf(chunk, "resourcetype");
   if (block !== null) {
-    return new RegExp(`<(?:[A-Za-z][\\w-]*:)?${localName}\\b`, "i").test(block);
+    return new RegExp(`<(?:[A-Za-z][\\w-]*:)?${localName}(?![\\w-])`, "i").test(block);
   }
   // Some servers return resourcetype as a self-closing wrapper; fall back to a
   // raw scan of the chunk.
-  return new RegExp(`<(?:[A-Za-z][\\w-]*:)?resourcetype\\b[^>]*>[\\s\\S]*?<(?:[A-Za-z][\\w-]*:)?${localName}\\b`, "i").test(chunk);
+  return new RegExp(`<(?:[A-Za-z][\\w-]*:)?resourcetype\\b[^>]*>[\\s\\S]*?<(?:[A-Za-z][\\w-]*:)?${localName}(?![\\w-])`, "i").test(chunk);
 }
 
 /** Pick the first href inside the named element, e.g. <addressbook-home-set><href>…</href></addressbook-home-set>. */

@@ -15,7 +15,7 @@
 import crypto from "node:crypto";
 import { mapWithConcurrency } from "../../util/concurrency.js";
 import { Buffer } from "node:buffer";
-import { CardDavClient, CardDavConflict, type AddressBookInfo } from "../../carddav/client.js";
+import { CardDavClient, CardDavConflict, davOptions, type AddressBookInfo } from "../../carddav/client.js";
 import { parseVCards, serializeVCard, type JsContact } from "../../carddav/vcard.js";
 import type { Credentials } from "../../auth/credentials.js";
 import type { ProviderConfig } from "../../util/config.js";
@@ -69,9 +69,7 @@ function ensureCardDav(provider: ProviderConfig): NonNullable<ProviderConfig["ca
 }
 
 function makeClient(ctx: ContactCtx): CardDavClient {
-  const { username, password, ...cfg } = ensureCardDav(ctx.provider);
-  const creds: Credentials = username && password ? { mech: "PLAIN", username, password } : ctx.creds;
-  return new CardDavClient({ ...cfg, creds });
+  return new CardDavClient(davOptions(ensureCardDav(ctx.provider), ctx.creds));
 }
 
 function encodeId(s: string): string {
@@ -309,13 +307,13 @@ interface SetResponse<Created> {
   notDestroyed: Record<string, SetError> | null;
 }
 
-function setError(type: string, description?: string, properties?: string[]): SetError {
+export function setError(type: string, description?: string, properties?: string[]): SetError {
   return { type, ...(description ? { description } : {}), ...(properties ? { properties } : {}) };
 }
 
-function errorFor(e: unknown, fallback = "serverFail"): SetError {
+export function errorFor(e: unknown, fallback = "serverFail"): SetError {
   if (e instanceof CardDavConflict) {
-    return setError("stateMismatch", "the resource changed on the CardDAV server; refetch and retry");
+    return setError("stateMismatch", "the resource changed on the DAV server; refetch and retry");
   }
   if (e instanceof JmapError) return setError(e.type, e.message);
   return setError(fallback, (e as Error)?.message);

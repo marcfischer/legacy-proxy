@@ -40,6 +40,16 @@ import {
   contactCardQueryChanges,
   contactsAvailable,
 } from "../jmap/methods/contacts.js";
+import {
+  calendarGet,
+  calendarEventGet,
+  calendarEventNotificationGet,
+  calendarEventNotificationQuery,
+  calendarEventParse,
+  calendarEventQuery,
+  calendarEventSet,
+  calendarsAvailable,
+} from "../jmap/methods/calendars.js";
 import { threadGet, threadChanges } from "../jmap/methods/threads.js";
 import { pushSubscriptionGet, pushSubscriptionSet } from "../jmap/methods/push.js";
 import { resolveProvider } from "../auth/providers.js";
@@ -151,6 +161,38 @@ function makeMethodTable(): Record<string, Handler> {
       const creds = await openCredentials(c.cfg.vaultKey, c.account.vault);
       return contactCardQueryChanges(a as never, { account: c.account, provider, creds });
     },
+    "Calendar/get": async (a, c) => {
+      const provider = resolveProvider(c.cfg, c.account.kind);
+      if (!calendarsAvailable(provider)) {
+        return {
+          accountId: (a as { accountId?: string }).accountId ?? String(c.account.id),
+          state: "0",
+          list: [],
+          notFound: ((a as { ids?: string[] | null }).ids ?? []) as string[],
+        };
+      }
+      const creds = await openCredentials(c.cfg.vaultKey, c.account.vault);
+      return calendarGet(a as never, { account: c.account, provider, creds });
+    },
+    "CalendarEvent/query": async (a, c) => {
+      const provider = resolveProvider(c.cfg, c.account.kind);
+      const creds = await openCredentials(c.cfg.vaultKey, c.account.vault);
+      return calendarEventQuery(a as never, { account: c.account, provider, creds });
+    },
+    "CalendarEvent/get": async (a, c) => {
+      const provider = resolveProvider(c.cfg, c.account.kind);
+      const creds = await openCredentials(c.cfg.vaultKey, c.account.vault);
+      return calendarEventGet(a as never, { account: c.account, provider, creds });
+    },
+    "CalendarEvent/set": async (a, c) => {
+      const provider = resolveProvider(c.cfg, c.account.kind);
+      const creds = await openCredentials(c.cfg.vaultKey, c.account.vault);
+      return calendarEventSet(a as never, { account: c.account, provider, creds });
+    },
+    "CalendarEvent/parse": async (a, c) =>
+      calendarEventParse(a as never, { account: c.account, store: c.store, pool: c.pool }),
+    "CalendarEventNotification/query": async (a, c) => calendarEventNotificationQuery(a as never, c.account),
+    "CalendarEventNotification/get": async (a, c) => calendarEventNotificationGet(a as never, c.account),
     "Mailbox/get": async (a, c) =>
       c.pool.withConnection(c.account, "interactive", (client) =>
         mailboxGet(a as never, { account: c.account, client, store: c.store }),

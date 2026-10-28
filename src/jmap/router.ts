@@ -105,6 +105,12 @@ const PARALLEL_SAFE_METHODS = new Set([
   "ContactCard/query",
   "ContactCard/changes",
   "ContactCard/queryChanges",
+  "Calendar/get",
+  "CalendarEvent/get",
+  "CalendarEvent/query",
+  "CalendarEvent/parse",
+  "CalendarEventNotification/query",
+  "CalendarEventNotification/get",
   "PushSubscription/get",
 ]);
 

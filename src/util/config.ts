@@ -1,6 +1,17 @@
 import fs from "node:fs";
 import path from "node:path";
 
+export interface DavConfig {
+  host: string;
+  port: number;
+  secure?: boolean;
+  basePath?: string;
+  principalPath?: string;
+  /** DAV login when it differs from the mail login; falls back to the IMAP credentials. */
+  username?: string;
+  password?: string;
+}
+
 export interface ProviderConfig {
   /**
    * Email domains served by this provider. When a client authenticates with a
@@ -13,16 +24,9 @@ export interface ProviderConfig {
   imap: { host: string; port: number; secure?: boolean; starttls?: boolean };
   smtp: { host: string; port: number; secure?: boolean; starttls?: boolean };
   sieve: { host: string; port: number; secure?: boolean; starttls?: boolean } | null;
-  carddav: {
-    host: string;
-    port: number;
-    secure?: boolean;
-    basePath?: string;
-    principalPath?: string;
-    /** DAV login when it differs from the mail login; falls back to the IMAP credentials. */
-    username?: string;
-    password?: string;
-  } | null;
+  carddav: DavConfig | null;
+  /** Optional; omitted or null means no calendars. */
+  caldav?: DavConfig | null;
   auth: { mech: string[] };
 }
 

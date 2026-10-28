@@ -63,6 +63,9 @@ JMAP method coverage:
 | PushSubscription  | `get`, `set` (verification handshake, relay forwarding, expiry caps) |
 | AddressBook       | `get`, `changes`, `set` (extended MKCOL / PROPPATCH / DELETE via CardDAV) |
 | ContactCard       | `get`, `query`, `queryChanges`, `changes`, `set` (PUT / DELETE via CardDAV) |
+| Calendar          | `get` (via CalDAV; calendars can't be created or renamed yet)         |
+| CalendarEvent     | `get`, `query` (`inCalendar(s)`, `after` / `before`, `uid`), `set` (PUT / DELETE via CalDAV), `parse` (uploads and mail parts) |
+| CalendarEventNotification | `query`, `get` (always empty: CalDAV has no notification inbox) |
 | Quota             | `get` (stub returning empty list, so probing clients don't error)    |
 
 Capabilities advertised on the Session resource:
@@ -72,6 +75,7 @@ Capabilities advertised on the Session resource:
 - `urn:ietf:params:jmap:submission`
 - `urn:ietf:params:jmap:vacationresponse`
 - `urn:ietf:params:jmap:contacts` (only when the active provider has CardDAV)
+- `urn:ietf:params:jmap:calendars` (only when the active provider has CalDAV)
 - `urn:bulwark:params:jmap:sieve` (vendor capability used by the vacation handler)
 
 Transport:
@@ -106,6 +110,15 @@ Backends:
   A CardDAV account with no collections at all (a fresh Radicale user, for
   example) gets a `Contacts` address book created on the first
   `ContactCard/set`.
+- CalDAV (RFC 4791) for Calendar and CalendarEvent. Event lists are a
+  `calendar-query` with the JMAP `after` / `before` range passed through as a
+  `time-range`; bodies come from `calendar-multiget` and are projected to
+  JSCalendar. Recurring series are returned as rules plus overrides, not
+  expanded; tasks (VTODO) are skipped. Writes are `PUT` (`If-None-Match: *` /
+  `If-Match`) and `DELETE`; an update re-serialises the event but keeps its
+  VTIMEZONEs and any properties the projection doesn't model. Moving an event
+  to another calendar is rejected, and the server's own scheduling decides
+  whether attendees get invitations (`sendSchedulingMessages` is ignored).
 
 Auth and storage:
 
@@ -671,15 +684,18 @@ URLs from `PUBLIC_URL` into `apiUrl`, `downloadUrl`, `uploadUrl`, and
 | `LOG_SUBMISSION_ADDRESSES` | unset                              | set to `1` to log sender and recipients of each send |
 
 `providers.example.json` ships entries for Gmail and a generic
-`$IMAP_HOST` / `$SMTP_HOST` / `$SIEVE_HOST` / `$CARDDAV_HOST` template.
-A `null` for any of `sieve` or `carddav` is allowed; the corresponding JMAP
-methods will then either return empty results or, for vacation, reject with
-the underlying ManageSieve error. An optional `domains` array on a provider
-opts it into domain-based [provider selection](#provider-selection);
+`$IMAP_HOST` / `$SMTP_HOST` / `$SIEVE_HOST` / `$CARDDAV_HOST` / `$CALDAV_HOST`
+template. A `null` for any of `sieve`, `carddav` or `caldav` is allowed; the
+corresponding JMAP methods will then either return empty results or, for
+vacation, reject with the underlying ManageSieve error. An optional `domains`
+array on a provider opts it into domain-based
+[provider selection](#provider-selection);
 `providers.two-servers.example.json` shows two providers wired up that way.
 When the DAV server uses a different login than the mail server, set
-`username` and `password` on the `carddav` entry (e.g.
-`"password": "$CARDDAV_PASSWORD"`); otherwise the IMAP credentials are reused.
+`username` and `password` on the `carddav` / `caldav` entry (e.g.
+`"password": "$DAV_PASSWORD"`); otherwise the IMAP credentials are reused.
+An optional `caldav` entry (same shape as `carddav`, discovery default
+`/.well-known/caldav`) turns on calendars.
 
 ## Tests
 
