@@ -132,7 +132,10 @@ function eventProps(v: Component): JsEvent {
   if (!duration) {
     duration = start && end ? formatDuration((utcMs(end) - utcMs(start)) / 1000, allDay) : allDay ? "P1D" : "PT0S";
   }
-  const utcStart = start && !allDay ? utcMs(start) : null;
+  // Floating time has no instant: reading it as UTC shifted Open-Xchange
+  // replies (no TZID) by the viewer's offset. Without utcStart the client
+  // shows the wall clock.
+  const utcStart = start && !allDay && start.tz ? utcMs(start) : null;
 
   const location = text(v, "LOCATION");
   const cls = prop(v, "CLASS")?.value.toUpperCase();
