@@ -79,6 +79,17 @@ describe("icalToEvent", () => {
     expect(icalToEvent("BEGIN:VCALENDAR\nBEGIN:VTODO\nUID:t\nEND:VTODO\nEND:VCALENDAR", "t", "c")).toBeNull();
   });
 
+  it("resolves Outlook's Windows zone names and keeps the zone when writing back", () => {
+    const outlook = [
+      "BEGIN:VCALENDAR", "METHOD:REQUEST", "BEGIN:VTIMEZONE", "TZID:W. Europe Standard Time", "END:VTIMEZONE",
+      "BEGIN:VEVENT", "UID:o", "DTSTART;TZID=W. Europe Standard Time:20261030T110000",
+      "DTEND;TZID=W. Europe Standard Time:20261030T120000", "END:VEVENT", "END:VCALENDAR",
+    ].join("\r\n");
+    const ev = icalToEvent(outlook, "e", "c")!;
+    expect(ev).toMatchObject({ start: "2026-10-30T11:00:00", timeZone: "Europe/Berlin", utcStart: "2026-10-30T10:00:00Z", duration: "PT1H" });
+    expect(eventToIcal(ev, outlook)).toMatch(/^DTSTART;TZID=Europe\/Berlin:20261030T110000\r?$/m);
+  });
+
   it("leaves floating time without a UTC instant", () => {
     const floating = "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:f\nDTSTART:20261028T110000\nDTEND:20261028T120000\nEND:VEVENT\nEND:VCALENDAR";
     expect(icalToEvent(floating, "e", "c")).toMatchObject({
