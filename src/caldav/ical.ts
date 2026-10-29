@@ -5,6 +5,7 @@
 
 import { escapeValue, fold, parseLine, unescapeValue, unfold, type ParsedLine } from "../carddav/vcard.js";
 import { applyPatch } from "../jmap/methods/contacts.js";
+import { WINDOWS_ZONES } from "./windows-zones.js";
 
 interface Component {
   type: string;
@@ -255,10 +256,13 @@ function parseDate(p: ParsedLine | undefined): IcalDate | null {
   if (!m[4]) return { local, tz: null, date: true };
   if (m[7]) return { local, tz: "Etc/UTC", date: false };
   const tzid = p.params.TZID?.[0];
-  // A TZID that isn't an IANA name (Outlook's "W. Europe Standard Time") is
-  // treated as floating time. Resolving it would mean evaluating the
-  // resource's VTIMEZONE, which we don't do yet.
-  return { local, tz: tzid && validZone(tzid) ? tzid : null, date: false };
+  // Outlook and Exchange write Windows zone names ("W. Europe Standard
+  // Time"). Read as floating time, an accepted invitation was written back
+  // without a zone and the server's reply put it an hour off. Any other
+  // unknown TZID is still floating: resolving it would mean evaluating the
+  // resource's VTIMEZONE, which we don't do.
+  const zone = tzid && (validZone(tzid) ? tzid : WINDOWS_ZONES[tzid]);
+  return { local, tz: zone || null, date: false };
 }
 
 /** The date's wall clock in `tz` (unchanged when either side is floating). */
