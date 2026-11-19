@@ -11,6 +11,7 @@ import { ImapPool } from "./imap/pool.js";
 import { resolveProvider, resolveProviderName } from "./auth/providers.js";
 import { sealCredentials, openCredentials, type Credentials } from "./auth/credentials.js";
 import { makeSession, signSession, verifySession } from "./auth/session.js";
+import { BLOB_CACHE_MAX_TOTAL_BYTES, BLOB_CACHE_TTL_MS } from "./jmap/blobs.js";
 import { buildSession } from "./jmap/session.js";
 import { KNOWN_CAPABILITIES } from "./jmap/capabilities.js";
 import { dispatch, type RequestEnvelope } from "./jmap/router.js";
@@ -181,13 +182,10 @@ app.post("/jmap", async (req, reply) => {
   }
 });
 
-// Blob cache bounds. Parts above the per-blob cap stream straight through
-// without being cached -- they are the ones streaming exists for, and holding
-// one in memory to write it to SQLite would undo that. The total cap keeps the
-// database file bounded; the TTL keeps a deleted message's parts from lingering.
+// Parts above this cap stream straight through without being cached -- they
+// are the ones streaming exists for, and holding one in memory to write it to
+// SQLite would undo that. Total cap and TTL live with readBlob in jmap/blobs.ts.
 const BLOB_CACHE_MAX_BYTES = 2 * 1024 * 1024;
-const BLOB_CACHE_MAX_TOTAL_BYTES = 256 * 1024 * 1024;
-const BLOB_CACHE_TTL_MS = 7 * 24 * 60 * 60_000;
 
 app.get<{ Params: { accountId: string; blobId: string; type: string; name: string } }>(
   "/jmap/download/:accountId/:blobId/:type/:name",
