@@ -188,3 +188,54 @@ it("parses uploaded .ics files and invitation parts, reporting unknown or event-
   expect(res.notFound).toEqual(["Umissing", gone, "garbage"]);
   await expect(calendarEventParse({ accountId: "2", blobIds: [] }, ctx)).rejects.toThrow();
 });
+
+it("evaluates a range and calendars sent as nested AND / OR", async () => {
+  const provider = { caldav: { host: "dav.example", port: 443, secure: true, username: "dav-user", password: "dav-pw", forUser: "mail" } } as ProviderConfig;
+  const ctx: CalendarCtx = { account: { id: 1 } as AccountRow, provider, creds: { mech: "PLAIN", username: "mail", password: "x" } };
+  const work = (await calendarGet({ accountId: "1" }, ctx)).list[0]!.id;
+
+  // What the webmail sends for "this range in these calendars": the bounds as
+  // single-key conditions of an AND, the calendars as an OR inside it.
+  const q = await calendarEventQuery(
+    {
+      accountId: "1",
+      filter: {
+        operator: "AND",
+        conditions: [
+          { after: "2026-10-01T00:00:00" },
+          { before: "2026-11-01T00:00:00" },
+          { operator: "OR", conditions: [{ inCalendar: work }, { inCalendar: "other" }] },
+        ],
+      },
+    },
+    ctx,
+  );
+  expect(q.total).toBe(1);
+  expect(reports.at(-1)).toContain(`start="20261001T000000Z" end="20261101T000000Z"`);
+
+  // Calendars that rule each other out leave nothing to ask the server.
+  const none = await calendarEventQuery(
+    { accountId: "1", filter: { operator: "AND", conditions: [{ inCalendar: work }, { inCalendar: "other" }] } },
+    ctx,
+  );
+  expect(none.ids).toEqual([]);
+
+  // The narrower of two bounds wins.
+  await calendarEventQuery(
+    { accountId: "1", filter: { operator: "AND", conditions: [{ after: "2026-09-01T00:00:00" }, { after: "2026-10-05T00:00:00", inCalendar: work }] } },
+    ctx,
+  );
+  expect(reports.at(-1)).toContain(`start="20261005T000000Z"`);
+});
+
+it("refuses NOT and an OR over anything but calendars", async () => {
+  const provider = { caldav: { host: "dav.example", port: 443, secure: true, username: "dav-user", password: "dav-pw", forUser: "mail" } } as ProviderConfig;
+  const ctx: CalendarCtx = { account: { id: 1 } as AccountRow, provider, creds: { mech: "PLAIN", username: "mail", password: "x" } };
+  for (const filter of [
+    { operator: "NOT", conditions: [{ inCalendar: "x" }] },
+    { operator: "OR", conditions: [{ after: "2026-10-01T00:00:00" }, { inCalendar: "x" }] },
+    { operator: "AND", conditions: [{ operator: "OR", conditions: [{ uid: "a" }, { uid: "b" }] }] },
+  ]) {
+    await expect(calendarEventQuery({ accountId: "1", filter: filter as never }, ctx)).rejects.toMatchObject({ type: "unsupportedFilter" });
+  }
+});

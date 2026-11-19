@@ -110,37 +110,87 @@ interface EventFilter {
 
 const FILTER_KEYS = new Set(["inCalendar", "inCalendars", "after", "before", "uid", "operator", "conditions"]);
 
+/** A filter reduced to what CalDAV can answer: calendars, a time range, a uid. */
+interface EventQueryPlan {
+  /** Calendar ids the event must be in; null = any. */
+  calendars: Set<string> | null;
+  after?: string;
+  before?: string;
+  uid?: string;
+}
+
 // Answering a filter we can't evaluate with every event is worse than failing:
 // Bulwark looks up a series' master with { uid } and edits the first recurring
 // event it gets back, which truncated an unrelated series before uid was
 // supported here.
-function checkFilter(f: EventFilter | undefined): void {
-  if (!f) return;
+//
+// What we can evaluate is an AND of calendar, range and uid conditions, in any
+// nesting: a condition with several keys is an AND of its keys (RFC 8620
+// §5.5), nested ANDs flatten, and an OR is fine as long as it only picks
+// calendars - that is how a client sends "this range, in these calendars".
+// Anything else (NOT, an OR over ranges or uids) is refused.
+function planFilter(f: EventFilter | undefined): EventQueryPlan {
+  const plan: EventQueryPlan = { calendars: null };
+  if (f) addToPlan(f, plan);
+  return plan;
+}
+
+function addToPlan(f: EventFilter, plan: EventQueryPlan): void {
   const unknown = Object.keys(f).filter((k) => !FILTER_KEYS.has(k));
   if (unknown.length) throw unsupportedFilter(`unsupported CalendarEvent filter: ${unknown.join(", ")}`);
-  for (const c of f.conditions ?? []) {
-    const extra = Object.keys(c).filter((k) => k !== "inCalendar");
-    if (extra.length) throw unsupportedFilter(`only inCalendar is supported inside conditions, got: ${extra.join(", ")}`);
+
+  if (f.operator !== undefined) {
+    const conditions = f.conditions ?? [];
+    if (f.operator === "AND") {
+      for (const c of conditions) addToPlan(c, plan);
+    } else if (f.operator === "OR") {
+      const ids = conditions.map(calendarIdsOnly);
+      if (ids.some((x) => x === null)) throw unsupportedFilter("only calendar conditions are supported inside OR");
+      restrictCalendars(plan, new Set((ids as string[][]).flat()));
+    } else {
+      throw unsupportedFilter(`unsupported CalendarEvent filter operator: ${String(f.operator)}`);
+    }
+    return;
+  }
+
+  if (f.inCalendar !== undefined) restrictCalendars(plan, new Set([f.inCalendar]));
+  if (f.inCalendars !== undefined) restrictCalendars(plan, new Set(f.inCalendars));
+  // Several bounds in one AND: the narrowest wins. LocalDateTimes of the same
+  // zone compare as strings.
+  if (f.after !== undefined && (plan.after === undefined || f.after > plan.after)) plan.after = f.after;
+  if (f.before !== undefined && (plan.before === undefined || f.before < plan.before)) plan.before = f.before;
+  if (f.uid !== undefined) {
+    // Two different uids can't both match; an impossible uid keeps that true.
+    plan.uid = plan.uid === undefined || plan.uid === f.uid ? f.uid : "\0no-such-uid";
   }
 }
 
-/** Calendar ids named by an inCalendar / inCalendars / OR-of-inCalendar filter; null = all. */
-function wantedCalendars(f: EventFilter | undefined): Set<string> | null {
-  if (!f) return null;
-  const ids = [f.inCalendar, ...(f.inCalendars ?? []), ...(f.conditions ?? []).map((c) => c.inCalendar)]
-    .filter((x): x is string => !!x);
-  return ids.length ? new Set(ids) : null;
+/** The calendar ids a condition names when it names nothing else, else null. */
+function calendarIdsOnly(c: EventFilter): string[] | null {
+  if (c.operator === "OR") {
+    const nested = (c.conditions ?? []).map(calendarIdsOnly);
+    return nested.some((x) => x === null) ? null : (nested as string[][]).flat();
+  }
+  const keys = Object.keys(c);
+  if (keys.length === 1 && c.inCalendar !== undefined) return [c.inCalendar];
+  if (keys.length === 1 && c.inCalendars !== undefined) return c.inCalendars;
+  return null;
+}
+
+function restrictCalendars(plan: EventQueryPlan, ids: Set<string>): void {
+  plan.calendars = plan.calendars ? new Set([...plan.calendars].filter((id) => ids.has(id))) : ids;
 }
 
 async function queryAll(ctx: CalendarCtx, filter?: EventFilter, timeZone?: string): Promise<{ ids: string[]; state: string }> {
   const client = makeClient(ctx);
   const cals = await client.listCalendars();
-  const wanted = wantedCalendars(filter);
+  const plan = planFilter(filter);
+  const wanted = plan.calendars;
   // after/before are LocalDateTimes in the request's time zone (UTC by default).
   const zone = timeZone ?? "Etc/UTC";
   const range = {
-    after: filter?.after ? localToUtc(filter.after.slice(0, 19), zone) : undefined,
-    before: filter?.before ? localToUtc(filter.before.slice(0, 19), zone) : undefined,
+    after: plan.after ? localToUtc(plan.after.slice(0, 19), zone) : undefined,
+    before: plan.before ? localToUtc(plan.before.slice(0, 19), zone) : undefined,
   };
   const targets = cals.filter((c) => !wanted || wanted.has(encodeId(c.href)));
   const perCal = await mapWithConcurrency(targets, 4, async (c) => {
@@ -148,9 +198,9 @@ async function queryAll(ctx: CalendarCtx, filter?: EventFilter, timeZone?: strin
     // CalDAV has a UID prop-filter, but servers are free to ignore text
     // matches (mailbox.org does), so match on the bodies instead; they mostly
     // come from the body cache.
-    if (filter?.uid) {
+    if (plan.uid !== undefined) {
       const res = await client.multiGetEvents(c.href, hrefs);
-      hrefs = res.filter((r) => icalToEvent(r.data, "", "")?.uid === filter.uid).map((r) => r.href);
+      hrefs = res.filter((r) => icalToEvent(r.data, "", "")?.uid === plan.uid).map((r) => r.href);
     }
     return hrefs.map((h) => encodeId(`${c.href}\n${h}`));
   });
@@ -162,7 +212,7 @@ export async function calendarEventQuery(
   ctx: CalendarCtx,
 ) {
   checkAccount(args.accountId, ctx);
-  checkFilter(args.filter);
+  planFilter(args.filter); // refuse what we can't evaluate before any CalDAV call
   // We don't implement `sort`: ids come back in server order, and Bulwark
   // sorts the expanded occurrences itself anyway.
   const { ids, state: s } = await queryAll(ctx, args.filter, args.timeZone);
