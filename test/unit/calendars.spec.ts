@@ -4,7 +4,7 @@
 // reads blobs, not CalDAV, so it gets a fake store and IMAP pool instead.
 
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { calendarEventGet, calendarEventParse, calendarEventQuery, calendarEventSet, calendarGet, type CalendarCtx } from "../../src/jmap/methods/calendars.js";
+import { calendarEventChanges, calendarEventGet, calendarEventParse, calendarEventQuery, calendarEventSet, calendarGet, type CalendarCtx } from "../../src/jmap/methods/calendars.js";
 import { resetCardDavCaches } from "../../src/carddav/client.js";
 import { resetCalDavCaches } from "../../src/caldav/client.js";
 import { Readable } from "node:stream";
@@ -20,6 +20,13 @@ const ms = (body: string) =>
 let reports: string[] = [];
 let store = new Map<string, { data: string; etag: string }>();
 let etagSeq = 1;
+// RFC 6578 change log of the fake server: every PUT / DELETE gets a sequence
+// number, and the sync token is the latest one.
+let changeLog: { seq: number; href: string; gone: boolean }[] = [];
+let syncSeq = 0;
+// A second calendar with a ctag but no sync token, like mailbox.org's birthdays.
+let birthdaysCtag: string | null = null;
+const logChange = (href: string, gone: boolean) => changeLog.push({ seq: ++syncSeq, href, gone });
 // Like real servers, answer with percent-encoded hrefs (`@` -> `%40`).
 const resp = (href: string, r: { data: string; etag: string }) =>
   `<D:response><D:href>${href.replace(/@/g, "%40")}</D:href><D:propstat><D:prop><D:getetag>${r.etag}</D:getetag><C:calendar-data>${r.data.replace(/&/g, "&amp;").replace(/</g, "&lt;")}</C:calendar-data></D:prop></D:propstat></D:response>`;
@@ -30,6 +37,9 @@ beforeEach(() => {
   reports = [];
   store = new Map([["/cal/u/work/1.ics", { data: EVENT, etag: `"1"` }]]);
   etagSeq = 1;
+  changeLog = [];
+  syncSeq = 0;
+  birthdaysCtag = null;
   vi.stubGlobal("fetch", async (url: string, init: RequestInit) => {
     const auth = (init.headers as Record<string, string>).Authorization;
     if (auth !== "Basic " + Buffer.from("dav-user:dav-pw").toString("base64")) return new Response("", { status: 401 });
@@ -45,8 +55,20 @@ beforeEach(() => {
       return ms(
         `<D:response><D:href>/cal/u/</D:href><D:propstat><D:prop><D:resourcetype><D:collection/></D:resourcetype></D:prop></D:propstat></D:response>` +
         `<D:response><D:href>/cal/u/proxy/</D:href><D:propstat><D:prop><D:resourcetype><D:collection/><C:calendar-proxy-read/></D:resourcetype></D:prop></D:propstat></D:response>` +
-        `<D:response><D:href>/cal/u/work/</D:href><D:propstat><D:prop><D:resourcetype><D:collection/><C:calendar/></D:resourcetype><D:displayname>Work</D:displayname><x:calendar-color xmlns:x="http://apple.com/ns/ical/">#FF0000FF</x:calendar-color></D:prop></D:propstat></D:response>`,
+        `<D:response><D:href>/cal/u/work/</D:href><D:propstat><D:prop><D:resourcetype><D:collection/><C:calendar/></D:resourcetype><D:displayname>Work</D:displayname><x:calendar-color xmlns:x="http://apple.com/ns/ical/">#FF0000FF</x:calendar-color><D:sync-token>http://t/${syncSeq}</D:sync-token></D:prop></D:propstat></D:response>` +
+        (birthdaysCtag === null ? "" : `<D:response><D:href>/cal/u/bday/</D:href><D:propstat><D:prop><D:resourcetype><D:collection/><C:calendar/></D:resourcetype><D:displayname>Birthdays</D:displayname><CS:getctag xmlns:CS="http://calendarserver.org/ns/">${birthdaysCtag}</CS:getctag></D:prop></D:propstat></D:response>`),
       );
+    if (init.method === "REPORT" && body.includes("sync-collection")) {
+      reports.push(body);
+      const since = /<D:sync-token>http:\/\/t\/(\d+)<\/D:sync-token>/.exec(body)?.[1];
+      if (since === undefined) return new Response("", { status: 403 });
+      const latest = new Map<string, boolean>();
+      for (const c of changeLog) if (c.seq > Number(since)) latest.set(c.href, c.gone);
+      const items = [...latest].map(([h, gone]) =>
+        gone ? `<D:response><D:href>${h}</D:href><D:status>HTTP/1.1 404 Not Found</D:status></D:response>` : resp(h, store.get(h)!),
+      );
+      return ms(items.join("") + `<D:sync-token>http://t/${syncSeq}</D:sync-token>`);
+    }
     if (init.method === "REPORT") {
       reports.push(body);
       const wanted = body.includes("calendar-multiget") ? [...body.matchAll(/<D:href>([^<]+)<\/D:href>/g)].map((m) => decodeURIComponent(m[1]!)) : [...store.keys()];
@@ -59,9 +81,14 @@ beforeEach(() => {
       if (headers["If-Match"] && headers["If-Match"] !== existing?.etag) return new Response("", { status: 412 });
       const etag = `"${++etagSeq}"`;
       store.set(path, { data: body, etag });
+      logChange(path, false);
       return new Response(null, { status: existing ? 204 : 201, headers: { etag } });
     }
-    if (init.method === "DELETE") return new Response(null, { status: store.delete(path) ? 204 : 404 });
+    if (init.method === "DELETE") {
+      const existed = store.delete(path);
+      if (existed) logChange(path, true);
+      return new Response(null, { status: existed ? 204 : 404 });
+    }
     return new Response("", { status: 404 });
   });
 });
@@ -275,4 +302,54 @@ it("finds events by text in title, description, location and people", async () =
   await expect(
     calendarEventQuery({ accountId: "1", filter: { operator: "OR", conditions: [{ text: "a" }, { text: "b" }] } as never }, ctx),
   ).rejects.toMatchObject({ type: "unsupportedFilter" });
+});
+
+it("answers CalendarEvent/changes from the calendars' sync tokens", async () => {
+  const provider = { caldav: { host: "dav.example", port: 443, secure: true, username: "dav-user", password: "dav-pw", forUser: "mail" } } as ProviderConfig;
+  const ctx: CalendarCtx = { account: { id: 1 } as AccountRow, provider, creds: { mech: "PLAIN", username: "mail", password: "x" } };
+  // Bulwark takes the state from CalendarEvent/get with no ids before listing.
+  const first = await calendarEventGet({ accountId: "1", ids: [] }, ctx);
+  const [existing] = (await calendarEventQuery({ accountId: "1" }, ctx)).ids;
+
+  // Another device adds one event and deletes the one we have.
+  store.set("/cal/u/work/2.ics", { data: EVENT.replace("UID:u1", "UID:u2"), etag: `"7"` });
+  logChange("/cal/u/work/2.ics", false);
+  store.delete("/cal/u/work/1.ics");
+  logChange("/cal/u/work/1.ics", true);
+
+  const ch = await calendarEventChanges({ accountId: "1", sinceState: first.state }, ctx);
+  expect(ch.destroyed).toEqual([existing]);
+  expect(ch.updated).toHaveLength(1);
+  const [added] = (await calendarEventGet({ accountId: "1", ids: ch.updated }, ctx)).list;
+  expect(added!.uid).toBe("u2");
+  // RFC 6578 asks for Depth 0; the depth goes in sync-level.
+  expect(reports.at(-2) ?? reports.at(-1)).toContain("<D:sync-level>1</D:sync-level>");
+
+  // Caught up: nothing more, and the state is the one the other methods give.
+  expect(await calendarEventChanges({ accountId: "1", sinceState: ch.newState }, ctx)).toMatchObject({ updated: [], destroyed: [] });
+  expect((await calendarEventGet({ accountId: "1", ids: [] }, ctx)).state).toBe(ch.newState);
+
+  // A token the server no longer knows, or a state from before sync tokens.
+  await expect(calendarEventChanges({ accountId: "1", sinceState: "S" + Buffer.from(JSON.stringify([["/cal/u/work/", "s:bogus"]])).toString("base64url") }, ctx)).rejects.toMatchObject({ type: "cannotCalculateChanges" });
+  await expect(calendarEventChanges({ accountId: "1", sinceState: "abc" }, ctx)).rejects.toMatchObject({ type: "cannotCalculateChanges" });
+  // More changes than the client takes: it lists again.
+  store.set("/cal/u/work/3.ics", { data: EVENT.replace("UID:u1", "UID:u3"), etag: `"8"` });
+  logChange("/cal/u/work/3.ics", false);
+  await expect(calendarEventChanges({ accountId: "1", sinceState: first.state, maxChanges: 1 }, ctx)).rejects.toMatchObject({ type: "cannotCalculateChanges" });
+});
+
+it("keeps CalendarEvent/changes working beside a calendar that has only a ctag", async () => {
+  const provider = { caldav: { host: "dav.example", port: 443, secure: true, username: "dav-user", password: "dav-pw", forUser: "mail" } } as ProviderConfig;
+  const ctx: CalendarCtx = { account: { id: 1 } as AccountRow, provider, creds: { mech: "PLAIN", username: "mail", password: "x" } };
+  birthdaysCtag = "b1";
+  const first = await calendarEventGet({ accountId: "1", ids: [] }, ctx);
+
+  store.set("/cal/u/work/2.ics", { data: EVENT.replace("UID:u1", "UID:u2"), etag: `"7"` });
+  logChange("/cal/u/work/2.ics", false);
+  const ch = await calendarEventChanges({ accountId: "1", sinceState: first.state }, ctx);
+  expect(ch.updated).toHaveLength(1);
+
+  // The birthday calendar changed: no token to ask with, so list again.
+  birthdaysCtag = "b2";
+  await expect(calendarEventChanges({ accountId: "1", sinceState: ch.newState }, ctx)).rejects.toMatchObject({ type: "cannotCalculateChanges" });
 });

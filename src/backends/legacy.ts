@@ -49,6 +49,7 @@ import {
   calendarEventQuery,
   calendarEventSet,
   calendarsAvailable,
+  calendarEventChanges,
 } from "../jmap/methods/calendars.js";
 import { threadGet, threadChanges } from "../jmap/methods/threads.js";
 import { pushSubscriptionGet, pushSubscriptionSet } from "../jmap/methods/push.js";
@@ -183,6 +184,11 @@ function makeMethodTable(): Record<string, Handler> {
       const provider = resolveProvider(c.cfg, c.account.kind);
       const creds = await openCredentials(c.cfg.vaultKey, c.account.vault);
       return calendarEventGet(a as never, { account: c.account, provider, creds });
+    },
+    "CalendarEvent/changes": async (a, c) => {
+      const provider = resolveProvider(c.cfg, c.account.kind);
+      const creds = await openCredentials(c.cfg.vaultKey, c.account.vault);
+      return calendarEventChanges(a as never, { account: c.account, provider, creds });
     },
     "CalendarEvent/set": async (a, c) => {
       const provider = resolveProvider(c.cfg, c.account.kind);

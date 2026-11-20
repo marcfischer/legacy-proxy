@@ -14,6 +14,8 @@ export interface CalendarInfo {
   description: string | null;
   color: string | null;
   ctag: string | null;
+  /** RFC 6578 sync token, when the server offers one. */
+  syncToken: string | null;
 }
 
 export interface ICalResource {
@@ -46,8 +48,9 @@ export class CalDavClient extends CardDavClient {
     super({ ...opts, caldav: true });
   }
 
-  async listCalendars(): Promise<CalendarInfo[]> {
-    const cached = freshEntry(calListCache.get(this.cacheKey), CAL_LIST_TTL_MS);
+  /** `fresh` skips the short-lived list cache: change detection must see the server's current tokens. */
+  async listCalendars(fresh = false): Promise<CalendarInfo[]> {
+    const cached = fresh ? undefined : freshEntry(calListCache.get(this.cacheKey), CAL_LIST_TTL_MS);
     if (cached) return cached.cals;
     const home = await this.addressBookHome(); // calendar-home-set in caldav mode
     const xml = await this.propfind(home, 1, [
@@ -70,6 +73,7 @@ export class CalDavClient extends CardDavClient {
         // Apple's #RRGGBBAA -> #RRGGBB
         color: color ? color.slice(0, 7) : null,
         ctag: textOf(r, "getctag") ?? textOf(r, "sync-token"),
+        syncToken: textOf(r, "sync-token") || null,
       });
     }
     calListCache.set(this.cacheKey, { cals: out, at: Date.now() });
@@ -112,6 +116,50 @@ export class CalDavClient extends CardDavClient {
     for (let i = 0; i < missing.length; i += MULTIGET_CHUNK) chunks.push(missing.slice(i, i + MULTIGET_CHUNK));
     const fetched = await mapWithConcurrency(chunks, MULTIGET_CONCURRENCY, (c) => this.fetchEvents(calHref, c));
     return out.concat(fetched.flat());
+  }
+
+  /**
+   * What changed in a calendar since `token` (RFC 6578 sync-collection):
+   * resources added or changed, resources removed, and the token to ask with
+   * next. Null when the server can't say - the token expired or is unknown,
+   * or the answer was truncated - so the caller starts over.
+   */
+  async syncChanges(calHref: string, token: string): Promise<{ token: string; changed: string[]; removed: string[] } | null> {
+    const body =
+      `<?xml version="1.0" encoding="utf-8"?>\n` +
+      `<D:sync-collection xmlns:D="DAV:"><D:sync-token>${token.replace(/&/g, "&amp;").replace(/</g, "&lt;")}</D:sync-token>` +
+      `<D:sync-level>1</D:sync-level><D:prop><D:getetag/></D:prop></D:sync-collection>`;
+    let xml: string;
+    try {
+      // RFC 6578 §3.2: the depth is in sync-level; the Depth header is 0.
+      xml = await this.request("REPORT", calHref, body, { Depth: "0" });
+    } catch {
+      return null;
+    }
+    const changed: string[] = [];
+    const removed: string[] = [];
+    const now = Date.now();
+    for (const r of splitResponses(xml)) {
+      const href = extractHref(r);
+      if (!href) continue;
+      // A member's own status (no propstat) is how removal is reported; 507
+      // on the collection itself means the server cut the list short.
+      const status = /<(?:[A-Za-z][\w-]*:)?propstat\b/i.test(r) ? null : /\s(\d{3})\s/.exec(textOf(r, "status") ?? "")?.[1] ?? null;
+      if (status === "507") return null;
+      if (href === calHref) continue;
+      if (status === "404") {
+        removed.push(href);
+        etagCache.delete(`${this.cacheKey}|${href}`);
+        continue;
+      }
+      const etag = textOf(r, "getetag");
+      if (etag) etagCache.set(`${this.cacheKey}|${href}`, { etag, at: now });
+      changed.push(href);
+    }
+    // The new token follows the responses at the top level.
+    const tokens = [...xml.matchAll(/<(?:[A-Za-z][\w-]*:)?sync-token\b[^>]*>([\s\S]*?)<\/(?:[A-Za-z][\w-]*:)?sync-token>/gi)];
+    const next = tokens.at(-1)?.[1]?.trim();
+    return next ? { token: next, changed, removed } : null;
   }
 
   /** PUT an iCalendar resource; same If-Match / If-None-Match rules as the CardDAV putResource. */

@@ -62,6 +62,44 @@ function state(cals: CalendarInfo[]): string {
   return h.digest("base64url").slice(0, 16);
 }
 
+// CalendarEvent state: per calendar its RFC 6578 sync token ("s:"), or for a
+// calendar without one its ctag ("c:"). CalendarEvent/changes asks each
+// calendar with a token what changed since, without keeping anything on our
+// side; a calendar known only by ctag (mailbox.org's birthday calendar) can
+// only say "nothing" or "can't tell". Without even a ctag the state is the
+// old hash and /changes can only say cannotCalculateChanges.
+const SYNC_STATE_PREFIX = "S";
+
+function eventStateOf(entries: [string, string][]): string {
+  return SYNC_STATE_PREFIX + Buffer.from(JSON.stringify(entries), "utf8").toString("base64url");
+}
+
+function versionOf(c: CalendarInfo): string | null {
+  return c.syncToken ? `s:${c.syncToken}` : c.ctag ? `c:${c.ctag}` : null;
+}
+
+function eventState(cals: CalendarInfo[]): string {
+  const versions = cals.map(versionOf);
+  if (cals.length === 0 || versions.some((v) => v === null)) return state(cals);
+  return eventStateOf(cals.map((c, i) => [c.href, versions[i]!]));
+}
+
+function decodeEventState(s: string): Map<string, string> | null {
+  if (!s.startsWith(SYNC_STATE_PREFIX)) return null;
+  try {
+    const entries = JSON.parse(Buffer.from(s.slice(SYNC_STATE_PREFIX.length), "base64url").toString("utf8")) as unknown;
+    if (!Array.isArray(entries) || !entries.every((e) => Array.isArray(e) && e.length === 2 && e.every((x) => typeof x === "string"))) return null;
+    return new Map(entries as [string, string][]);
+  } catch {
+    return null;
+  }
+}
+
+/** The account's current CalendarEvent state, read from the server (no list cache). */
+export async function calendarEventState(ctx: CalendarCtx): Promise<string> {
+  return eventState(await makeClient(ctx).listCalendars(true));
+}
+
 function checkAccount(accountId: string, ctx: CalendarCtx): void {
   if (accountId !== String(ctx.account.id)) throw accountNotFound();
 }
@@ -227,7 +265,7 @@ async function queryAll(ctx: CalendarCtx, filter?: EventFilter, timeZone?: strin
     }
     return hrefs.map((h) => encodeId(`${c.href}\n${h}`));
   });
-  return { ids: perCal.flat(), state: state(cals) };
+  return { ids: perCal.flat(), state: eventState(cals) };
 }
 
 /** The strings a text condition looks at, from the event and its overrides. */
@@ -309,7 +347,7 @@ export async function calendarEventGet(args: { accountId: string; ids?: string[]
     }
     for (const [href, id] of hrefs) if (!found.has(href)) notFound.push(id);
   });
-  return { accountId: args.accountId, state: state(cals), list, notFound };
+  return { accountId: args.accountId, state: eventState(cals), list, notFound };
 }
 
 // -- CalendarEvent/set -------------------------------------------------------------
@@ -343,7 +381,7 @@ export async function calendarEventSet(
   checkAccount(args.accountId, ctx);
   const client = makeClient(ctx);
   const cals = await client.listCalendars();
-  const oldState = state(cals);
+  const oldState = eventState(cals);
   if (args.ifInState && args.ifInState !== oldState) throw new JmapError("stateMismatch", "ifInState does not match");
 
   const created: Record<string, { id: string; uid: string }> = {};
@@ -419,7 +457,7 @@ export async function calendarEventSet(
   return {
     accountId: args.accountId,
     oldState,
-    newState: state(await client.listCalendars()),
+    newState: eventState(await client.listCalendars()),
     created: orNull(created),
     updated: orNull(updated),
     destroyed: destroyed.length ? destroyed : null,
@@ -430,6 +468,49 @@ export async function calendarEventSet(
 }
 
 // -- CalendarEventNotification/query, /get ----------------------------------------
+
+// -- CalendarEvent/changes ---------------------------------------------------------
+
+export async function calendarEventChanges(
+  args: { accountId: string; sinceState: string; maxChanges?: number | null },
+  ctx: CalendarCtx,
+) {
+  checkAccount(args.accountId, ctx);
+  const client = makeClient(ctx);
+  const cals = await client.listCalendars(true);
+  const current = eventState(cals);
+  const unchanged = { accountId: args.accountId, oldState: args.sinceState, newState: current, hasMoreChanges: false, created: [], updated: [], destroyed: [] };
+  if (args.sinceState === current) return unchanged;
+
+  // A calendar added or removed since: its events can't be told apart as
+  // created or destroyed from tokens alone, so the client lists again.
+  const since = decodeEventState(args.sinceState);
+  if (!since || since.size !== cals.length || cals.some((c) => !versionOf(c) || !since.has(c.href))) throw new JmapError("cannotCalculateChanges");
+
+  const updated: string[] = [];
+  const destroyed: string[] = [];
+  const versions: [string, string][] = [];
+  for (const c of cals) {
+    const was = since.get(c.href)!;
+    const now = versionOf(c)!;
+    if (was === now) {
+      versions.push([c.href, was]);
+      continue;
+    }
+    // Only a sync token can say what changed.
+    const delta = was.startsWith("s:") && c.syncToken ? await client.syncChanges(c.href, was.slice(2)) : null;
+    if (!delta) throw new JmapError("cannotCalculateChanges");
+    // sync-collection doesn't say whether a resource is new or changed, and
+    // RFC 8620 lets an id the client doesn't know arrive as updated.
+    updated.push(...delta.changed.map((h) => encodeId(`${c.href}\n${h}`)));
+    destroyed.push(...delta.removed.map((h) => encodeId(`${c.href}\n${h}`)));
+    versions.push([c.href, `s:${delta.token}`]);
+  }
+  // Rather than invent paging over tokens, a client that wants fewer changes
+  // than there are lists again.
+  if (args.maxChanges && updated.length + destroyed.length > args.maxChanges) throw new JmapError("cannotCalculateChanges");
+  return { ...unchanged, newState: eventStateOf(versions), updated, destroyed };
+}
 
 // CalDAV has no notification inbox. Bulwark polls these on every login and
 // logs an error when the methods are missing, so answer with an empty one.

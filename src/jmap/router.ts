@@ -108,6 +108,7 @@ const PARALLEL_SAFE_METHODS = new Set([
   "Calendar/get",
   "CalendarEvent/get",
   "CalendarEvent/query",
+  "CalendarEvent/changes",
   "CalendarEvent/parse",
   "CalendarEventNotification/query",
   "CalendarEventNotification/get",
