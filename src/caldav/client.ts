@@ -38,7 +38,12 @@ const ETAG_TTL_MS = 60_000;
 const MULTIGET_CHUNK = 100;
 const MULTIGET_CONCURRENCY = 4;
 
+// The addresses a principal schedules as change rarely (an alias added).
+const addressCache = new Map<string, { addrs: string[]; at: number }>();
+const ADDRESS_TTL_MS = 10 * 60_000;
+
 export function resetCalDavCaches(): void {
+  addressCache.clear();
   calListCache.clear();
   etagCache.clear();
 }
@@ -46,6 +51,26 @@ export function resetCalDavCaches(): void {
 export class CalDavClient extends CardDavClient {
   constructor(opts: Omit<CardDavOpts, "caldav">) {
     super({ ...opts, caldav: true });
+  }
+
+  /**
+   * The user's scheduling addresses (RFC 6638 calendar-user-address-set) as
+   * plain e-mail addresses, the preferred one first. mailbox.org lists every
+   * alias of the mailbox here.
+   */
+  async calendarUserAddresses(): Promise<string[]> {
+    const cached = freshEntry(addressCache.get(this.cacheKey), ADDRESS_TTL_MS);
+    if (cached) return cached.addrs;
+    const principal = await this.discoverPrincipal();
+    const xml = await this.propfind(principal, 0, ["urn:ietf:params:xml:ns:caldav calendar-user-address-set"]);
+    const set = /<(?:[A-Za-z][\w-]*:)?calendar-user-address-set\b[^>]*>([\s\S]*?)<\/(?:[A-Za-z][\w-]*:)?calendar-user-address-set>/i.exec(xml)?.[1] ?? "";
+    const entries = [...set.matchAll(/<(?:[A-Za-z][\w-]*:)?href\b([^>]*)>([\s\S]*?)<\/(?:[A-Za-z][\w-]*:)?href>/gi)]
+      .map((m) => ({ preferred: /preferred\s*=\s*"1"/.test(m[1] ?? ""), value: (m[2] ?? "").trim() }))
+      .filter((e) => /^mailto:/i.test(e.value));
+    entries.sort((a, b) => Number(b.preferred) - Number(a.preferred));
+    const addrs = [...new Set(entries.map((e) => decodeURIComponent(e.value.replace(/^mailto:/i, ""))))];
+    addressCache.set(this.cacheKey, { addrs, at: Date.now() });
+    return addrs;
   }
 
   /** `fresh` skips the short-lived list cache: change detection must see the server's current tokens. */

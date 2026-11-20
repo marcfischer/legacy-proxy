@@ -251,17 +251,32 @@ export interface ParticipantIdentityJson {
   isDefault: boolean;
 }
 
-function projectParticipantIdentity(account: AccountRow, store: Store): ParticipantIdentityJson {
+/**
+ * The login's identity first (the default), then one per further scheduling
+ * address the calendar server knows for the user - on mailbox.org every alias
+ * of the mailbox - so an invitation sent to an alias is still recognised as
+ * the user's.
+ */
+function participantIdentities(account: AccountRow, store: Store, addresses: string[]): ParticipantIdentityJson[] {
   const mail = projectIdentity(account, store);
-  return { id: mail.id, name: mail.name, calendarAddress: `mailto:${mail.email}`, isDefault: true };
+  const out: ParticipantIdentityJson[] = [{ id: mail.id, name: mail.name, calendarAddress: `mailto:${mail.email}`, isDefault: true }];
+  const seen = new Set([mail.email.toLowerCase()]);
+  for (const addr of addresses) {
+    const key = addr.toLowerCase();
+    if (seen.has(key) || !addr.includes("@")) continue;
+    seen.add(key);
+    out.push({ id: `${mail.id}-${Buffer.from(key, "utf8").toString("base64url")}`, name: mail.name, calendarAddress: `mailto:${addr}`, isDefault: false });
+  }
+  return out;
 }
 
 export function participantIdentityGet(
   args: { accountId: string; ids?: string[] | null },
   ctx: { account: AccountRow; store: Store },
+  addresses: string[] = [],
 ) {
   if (args.accountId !== String(ctx.account.id)) throw accountNotFound();
-  const all = [projectParticipantIdentity(ctx.account, ctx.store)];
+  const all = participantIdentities(ctx.account, ctx.store, addresses);
   const ids = args.ids ?? null;
   return {
     accountId: args.accountId,
@@ -271,9 +286,9 @@ export function participantIdentityGet(
   };
 }
 
-// There is exactly one identity and it is the default: making it the default
-// succeeds without a change, anything that would add, change or remove one
-// is refused per object.
+// The identities follow the mail login and the calendar server: the login's
+// is the default. Making it the default succeeds without a change; anything
+// that would add, change or remove one is refused per object.
 export function participantIdentitySet(
   args: {
     accountId: string;
@@ -283,19 +298,24 @@ export function participantIdentitySet(
     onSuccessSetIsDefault?: string | null;
   },
   ctx: { account: AccountRow; store: Store },
+  addresses: string[] = [],
 ) {
   if (args.accountId !== String(ctx.account.id)) throw accountNotFound();
   const id = singletonId(ctx.account.id);
+  const known = new Set(participantIdentities(ctx.account, ctx.store, addresses).map((i) => i.id));
   if (args.onSuccessSetIsDefault != null && args.onSuccessSetIsDefault !== id) {
-    throw new JmapError("invalidArguments", `no participant identity ${args.onSuccessSetIsDefault}`);
+    throw new JmapError(
+      "invalidArguments",
+      known.has(args.onSuccessSetIsDefault) ? "the default participant identity is the mail login's" : `no participant identity ${args.onSuccessSetIsDefault}`,
+    );
   }
   const forbidden = { type: "forbidden", description: "participant identities follow the mail login" };
   const notCreated = Object.fromEntries(Object.keys(args.create ?? {}).map((k) => [k, forbidden]));
   const notUpdated = Object.fromEntries(
-    Object.keys(args.update ?? {}).map((k) => [k, k === id ? forbidden : { type: "notFound" }]),
+    Object.keys(args.update ?? {}).map((k) => [k, known.has(k) ? forbidden : { type: "notFound" }]),
   );
   const notDestroyed = Object.fromEntries(
-    (args.destroy ?? []).map((k) => [k, k === id ? forbidden : { type: "notFound" }]),
+    (args.destroy ?? []).map((k) => [k, known.has(k) ? forbidden : { type: "notFound" }]),
   );
   const state = identityState(ctx.store, ctx.account.id);
   return {

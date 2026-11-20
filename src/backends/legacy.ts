@@ -1,3 +1,4 @@
+import { log } from "../util/log.js";
 import type { ImapPool } from "../imap/pool.js";
 import type { Store, AccountRow } from "../state/store.js";
 import type { AppConfig } from "../util/config.js";
@@ -50,6 +51,7 @@ import {
   calendarEventSet,
   calendarsAvailable,
   calendarEventChanges,
+  calendarUserAddresses,
 } from "../jmap/methods/calendars.js";
 import { threadGet, threadChanges } from "../jmap/methods/threads.js";
 import { pushSubscriptionGet, pushSubscriptionSet } from "../jmap/methods/push.js";
@@ -66,6 +68,20 @@ export interface LegacyContext {
 }
 
 type Handler = (args: Record<string, unknown>, ctx: LegacyContext) => Promise<unknown>;
+
+// Aliases come from the calendar server; without one, or when it can't be
+// reached, the login's identity alone is still a valid answer.
+async function schedulingAddresses(c: LegacyContext): Promise<string[]> {
+  const provider = resolveProvider(c.cfg, c.account.kind);
+  if (!calendarsAvailable(provider)) return [];
+  try {
+    const creds = await openCredentials(c.cfg.vaultKey, c.account.vault);
+    return await calendarUserAddresses({ account: c.account, provider, creds });
+  } catch (e) {
+    log.warn({ err: (e as Error).message }, "ParticipantIdentity: could not read scheduling addresses");
+    return [];
+  }
+}
 
 function makeMethodTable(): Record<string, Handler> {
   return {
@@ -199,8 +215,10 @@ function makeMethodTable(): Record<string, Handler> {
       calendarEventParse(a as never, { account: c.account, store: c.store, pool: c.pool }),
     "CalendarEventNotification/query": async (a, c) => calendarEventNotificationQuery(a as never, c.account),
     "CalendarEventNotification/get": async (a, c) => calendarEventNotificationGet(a as never, c.account),
-    "ParticipantIdentity/get": async (a, c) => participantIdentityGet(a as never, { account: c.account, store: c.store }),
-    "ParticipantIdentity/set": async (a, c) => participantIdentitySet(a as never, { account: c.account, store: c.store }),
+    "ParticipantIdentity/get": async (a, c) =>
+      participantIdentityGet(a as never, { account: c.account, store: c.store }, await schedulingAddresses(c)),
+    "ParticipantIdentity/set": async (a, c) =>
+      participantIdentitySet(a as never, { account: c.account, store: c.store }, await schedulingAddresses(c)),
     "Mailbox/get": async (a, c) =>
       c.pool.withConnection(c.account, "interactive", (client) =>
         mailboxGet(a as never, { account: c.account, client, store: c.store }),

@@ -51,3 +51,20 @@ it("accepts making the one identity the default and refuses changes to the set",
   expect(() => participantIdentitySet({ accountId: "1", onSuccessSetIsDefault: "other" }, { account, store })).toThrow();
   expect(() => participantIdentityGet({ accountId: "2" }, { account, store })).toThrow();
 });
+
+it("lists the calendar server's other addresses as further identities", () => {
+  const got = participantIdentityGet({ accountId: "1" }, { account, store }, ["MARC@example.org", "kontakt@example.org", "invoice@example.org", "kontakt@example.org"]);
+  expect(got.list.map((i) => [i.calendarAddress, i.isDefault])).toEqual([
+    ["mailto:marc@example.org", true],
+    ["mailto:kontakt@example.org", false],
+    ["mailto:invoice@example.org", false],
+  ]);
+  // Ids are stable, so a client's cached identities stay valid.
+  const again = participantIdentityGet({ accountId: "1" }, { account, store }, ["invoice@example.org", "kontakt@example.org"]);
+  expect(again.list.slice(1).map((i) => i.id).sort()).toEqual(got.list.slice(1).map((i) => i.id).sort());
+
+  const alias = got.list[1]!.id;
+  const res = participantIdentitySet({ accountId: "1", destroy: [alias] }, { account, store }, ["kontakt@example.org"]);
+  expect(res.notDestroyed).toMatchObject({ [alias]: { type: "forbidden" } });
+  expect(() => participantIdentitySet({ accountId: "1", onSuccessSetIsDefault: alias }, { account, store }, ["kontakt@example.org"])).toThrow(/mail login/);
+});

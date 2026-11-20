@@ -100,6 +100,11 @@ export async function calendarEventState(ctx: CalendarCtx): Promise<string> {
   return eventState(await makeClient(ctx).listCalendars(true));
 }
 
+/** The user's scheduling addresses on the calendar server (aliases included). */
+export async function calendarUserAddresses(ctx: CalendarCtx): Promise<string[]> {
+  return makeClient(ctx).calendarUserAddresses();
+}
+
 function checkAccount(accountId: string, ctx: CalendarCtx): void {
   if (accountId !== String(ctx.account.id)) throw accountNotFound();
 }

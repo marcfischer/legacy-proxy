@@ -4,7 +4,7 @@
 // reads blobs, not CalDAV, so it gets a fake store and IMAP pool instead.
 
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { calendarEventChanges, calendarEventGet, calendarEventParse, calendarEventQuery, calendarEventSet, calendarGet, type CalendarCtx } from "../../src/jmap/methods/calendars.js";
+import { calendarEventChanges, calendarUserAddresses, calendarEventGet, calendarEventParse, calendarEventQuery, calendarEventSet, calendarGet, type CalendarCtx } from "../../src/jmap/methods/calendars.js";
 import { resetCardDavCaches } from "../../src/carddav/client.js";
 import { resetCalDavCaches } from "../../src/caldav/client.js";
 import { Readable } from "node:stream";
@@ -49,6 +49,12 @@ beforeEach(() => {
     if (init.method === "PROPFIND" && path === "/dav/" && body.includes("current-user-principal"))
       return ms(`<D:response><D:href>/dav/</D:href><D:propstat><D:prop><D:current-user-principal><D:href>/p/u/</D:href></D:current-user-principal></D:prop></D:propstat></D:response>`);
     if (init.method === "PROPFIND" && path === "/dav/") return ms(`<D:response><D:href>/dav/</D:href></D:response>`);
+    if (init.method === "PROPFIND" && path === "/p/u/" && body.includes("calendar-user-address-set"))
+      return ms(
+        `<D:response><D:href>/p/u/</D:href><D:propstat><D:prop><calendar-user-address-set xmlns="urn:ietf:params:xml:ns:caldav">` +
+        `<D:href>mailto:alias%40example.org</D:href><D:href preferred="1">mailto:mail@example.org</D:href><D:href>/p/u/</D:href><D:href>urn:uuid:1</D:href>` +
+        `</calendar-user-address-set></D:prop></D:propstat></D:response>`,
+      );
     if (init.method === "PROPFIND" && path === "/p/u/")
       return ms(`<D:response><D:href>/p/u/</D:href><D:propstat><D:prop><C:calendar-home-set><D:href>/cal/u/</D:href></C:calendar-home-set></D:prop></D:propstat></D:response>`);
     if (init.method === "PROPFIND" && path === "/cal/u/")
@@ -352,4 +358,10 @@ it("keeps CalendarEvent/changes working beside a calendar that has only a ctag",
   // The birthday calendar changed: no token to ask with, so list again.
   birthdaysCtag = "b2";
   await expect(calendarEventChanges({ accountId: "1", sinceState: ch.newState }, ctx)).rejects.toMatchObject({ type: "cannotCalculateChanges" });
+});
+
+it("reads the user's scheduling addresses, preferred first, mailto only", async () => {
+  const provider = { caldav: { host: "dav.example", port: 443, secure: true, username: "dav-user", password: "dav-pw", forUser: "mail" } } as ProviderConfig;
+  const ctx: CalendarCtx = { account: { id: 1 } as AccountRow, provider, creds: { mech: "PLAIN", username: "mail", password: "x" } };
+  expect(await calendarUserAddresses(ctx)).toEqual(["mail@example.org", "alias@example.org"]);
 });
