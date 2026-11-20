@@ -4,7 +4,7 @@
 // reads blobs, not CalDAV, so it gets a fake store and IMAP pool instead.
 
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { calendarEventChanges, calendarSet, calendarUserAddresses, calendarEventGet, calendarEventParse, calendarEventQuery, calendarEventSet, calendarGet, type CalendarCtx } from "../../src/jmap/methods/calendars.js";
+import { isMember, calendarEventChanges, calendarSet, calendarUserAddresses, calendarEventGet, calendarEventParse, calendarEventQuery, calendarEventSet, calendarGet, type CalendarCtx } from "../../src/jmap/methods/calendars.js";
 import { resetCardDavCaches } from "../../src/carddav/client.js";
 import { resetCalDavCaches } from "../../src/caldav/client.js";
 import { Readable } from "node:stream";
@@ -37,6 +37,8 @@ let plainServer = false;
 let noEtags = false;
 // Reports a removed member as "HTTP/1.1 404", without a reason phrase.
 let bareStatus = false;
+// Answers a Depth-1 PROPFIND on a calendar with its own href written as an absolute URL without the slash.
+let oddSelfHref = false;
 const propOf = (body: string, name: string) => new RegExp(`<[A-Z]:${name}>([^<]*)</[A-Z]:${name}>`).exec(body)?.[1];
 const logChange = (href: string, gone: boolean) => changeLog.push({ seq: ++syncSeq, href, gone });
 // Like real servers, answer with percent-encoded hrefs (`@` -> `%40`).
@@ -57,6 +59,7 @@ beforeEach(() => {
   plainServer = false;
   noEtags = false;
   bareStatus = false;
+  oddSelfHref = false;
   vi.stubGlobal("fetch", async (url: string, init: RequestInit) => {
     const auth = (init.headers as Record<string, string>).Authorization;
     if (auth !== "Basic " + Buffer.from("dav-user:dav-pw").toString("base64")) return new Response("", { status: 401 });
@@ -88,7 +91,8 @@ beforeEach(() => {
       );
     if (init.method === "PROPFIND" && collections.has(path) && body.includes("getetag")) {
       const members = [...store].filter(([h]) => h.startsWith(path));
-      return ms(`<D:response><D:href>${path}</D:href></D:response>` + members.map(([h, r]) =>
+      const self = oddSelfHref ? `https://dav.example${path.replace(/\/$/, "")}` : path;
+      return ms(`<D:response><D:href>${self}</D:href><D:propstat><D:prop><D:resourcetype><D:collection/><C:calendar/></D:resourcetype></D:prop></D:propstat></D:response>` + members.map(([h, r]) =>
         `<D:response><D:href>${h}</D:href><D:propstat><D:prop><D:getetag>${r.etag}</D:getetag></D:prop></D:propstat></D:response>`).join(""));
     }
     if (init.method === "REPORT" && body.includes("sync-collection")) {
@@ -545,4 +549,77 @@ it("leaves SEQUENCE alone for a reply and raises it for a change", async () => {
   await calendarEventSet({ accountId: "1", update: { [id!]: { title: "Moved" } } }, ctx);
   data = store.get("/cal/u/work/1.ics")!.data;
   expect(data).toMatch(/^SEQUENCE:4$/m);
+});
+
+// -- Review fixes, second round ---------------------------------------------------
+
+it("finds the etag digest when the calendar names itself differently", async () => {
+  plainServer = true;
+  oddSelfHref = true;
+  const ctx = plainCtx();
+  const a = (await calendarEventGet({ accountId: "1", ids: [] }, ctx)).state;
+  resetCalDavCaches();
+  const b = (await calendarEventGet({ accountId: "1", ids: [] }, ctx)).state;
+  // A digest, not a state minted fresh on every read.
+  expect(a).toBe(b);
+  expect(a.startsWith("S")).toBe(true);
+});
+
+it("matches event hrefs against their calendar however the server writes them", () => {
+  expect(isMember({ calHref: "/cal/u/work/", href: "https://dav.example/cal/u/work/1.ics" })).toBe(true);
+  expect(isMember({ calHref: "/cal/u/my%20work/", href: "/cal/u/my work/1.ics" })).toBe(true);
+  expect(isMember({ calHref: "/cal/u/work", href: "/cal/u/work/1.ics" })).toBe(true);
+  expect(isMember({ calHref: "/cal/u/work/", href: "/cal/u/work/" })).toBe(false);
+  expect(isMember({ calHref: "/cal/u/work/", href: "/cal/u/work/sub/1.ics" })).toBe(false);
+  expect(isMember({ calHref: "/cal/u/work/", href: "/cal/u/workshop/1.ics" })).toBe(false);
+});
+
+it("treats every way of answering an invitation as a reply, and leaves each VEVENT's SEQUENCE", async () => {
+  const ctx = plainCtx();
+  const series = [
+    "BEGIN:VCALENDAR", "VERSION:2.0",
+    "BEGIN:VEVENT", "UID:s1", "DTSTART:20261005T100000Z", "DTEND:20261005T110000Z", "RRULE:FREQ=WEEKLY", "SUMMARY:S", "SEQUENCE:0",
+    "ORGANIZER:mailto:boss@example.org", "ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:mail@example.org", "END:VEVENT",
+    "BEGIN:VEVENT", "UID:s1", "RECURRENCE-ID:20261012T100000Z", "DTSTART:20261012T120000Z", "DTEND:20261012T130000Z", "SUMMARY:S", "SEQUENCE:2",
+    "ORGANIZER:mailto:boss@example.org", "ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:mail@example.org", "END:VEVENT",
+    "END:VCALENDAR",
+  ].join("\r\n");
+  store.set("/cal/u/work/1.ics", { data: series, etag: `"1"` });
+  const [id] = (await calendarEventQuery({ accountId: "1" }, ctx)).ids;
+  const seqs = () => [...store.get("/cal/u/work/1.ics")!.data.matchAll(/^SEQUENCE:(\d+)$/gm)].map((m) => m[1]);
+
+  // A whole participants object that differs only in the answer.
+  const [ev] = (await calendarEventGet({ accountId: "1", ids: [id!] }, ctx)).list;
+  const parts = structuredClone(ev!.participants) as Record<string, Record<string, unknown>>;
+  for (const p of Object.values(parts)) if (p.email === "mail@example.org") p.participationStatus = "accepted";
+  await calendarEventSet({ accountId: "1", update: { [id!]: { participants: parts } } }, ctx);
+  expect(seqs()).toEqual(["0", "2"]);
+
+  // One occurrence's answer, through its override.
+  const [again] = (await calendarEventGet({ accountId: "1", ids: [id!] }, ctx)).list;
+  const key = Object.keys(again!.recurrenceOverrides as object)[0]!;
+  const o = structuredClone((again!.recurrenceOverrides as Record<string, Record<string, unknown>>)[key]!);
+  // The override answers like the series until it has an answer of its own.
+  o.participants ??= structuredClone(again!.participants);
+  for (const p of Object.values(o.participants as Record<string, Record<string, unknown>>)) if (p.email === "mail@example.org") p.participationStatus = "declined";
+  await calendarEventSet({ accountId: "1", update: { [id!]: { [`recurrenceOverrides/${key}`]: o } } }, ctx);
+  expect(seqs()).toEqual(["0", "2"]);
+  expect(store.get("/cal/u/work/1.ics")!.data).toMatch(/PARTSTAT=DECLINED/);
+
+  // A real change raises all of them past the highest.
+  await calendarEventSet({ accountId: "1", update: { [id!]: { title: "S2" } } }, ctx);
+  expect(seqs()).toEqual(["3", "3"]);
+});
+
+it("keeps an imported event's SEQUENCE and CREATED", async () => {
+  const ctx = plainCtx();
+  const [cal] = (await calendarGet({ accountId: "1" }, ctx)).list;
+  const res = await calendarEventSet({ accountId: "1", create: { n: {
+    calendarIds: { [cal!.id]: true }, uid: "imp-1", title: "Imported", start: "2026-10-05T10:00:00", timeZone: "Etc/UTC", duration: "PT1H",
+    sequence: 3, created: "2026-01-02T03:04:05Z",
+  } } }, ctx);
+  expect(res.created).toBeTruthy();
+  const data = store.get("/cal/u/work/imp-1.ics")!.data;
+  expect(data).toMatch(/^SEQUENCE:3$/m);
+  expect(data).toMatch(/^CREATED:20260102T030405Z$/m);
 });

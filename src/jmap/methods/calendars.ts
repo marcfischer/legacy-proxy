@@ -5,10 +5,10 @@
 
 import crypto from "node:crypto";
 import { Buffer } from "node:buffer";
-import { CalDavClient, type CalendarInfo } from "../../caldav/client.js";
+import { CalDavClient, normalizeHref, type CalendarInfo } from "../../caldav/client.js";
 import { davOptions } from "../../carddav/client.js";
 import { eventToIcal, highestSequence, icalToEvent, icalToEvents, localToUtc, type JsEvent } from "../../caldav/ical.js";
-import { applyPatch, errorFor, setError } from "./contacts.js";
+import { applyPatch, errorFor, setError } from "./dav.js";
 import type { CalendarProps } from "../../caldav/client.js";
 import { mapWithConcurrency } from "../../util/concurrency.js";
 import { log } from "../../util/log.js";
@@ -25,8 +25,8 @@ export interface CalendarCtx {
   creds: Credentials;
 }
 
-// Events can be written; the calendars themselves (create, rename, share)
-// cannot yet.
+// Events and calendars can be created, changed and deleted. Sharing is not
+// offered (mayAdmin), CalDAV has no portable way to manage it.
 const RIGHTS = {
   mayReadFreeBusy: true,
   mayReadItems: true,
@@ -595,19 +595,46 @@ const EVENT_READ_ONLY = new Set(["id", "uid", "@type", "created", "updated", "ut
 
 // An event id names a resource directly inside its calendar; anything else
 // (the calendar itself, something below or beside it) is not an event.
-function isMember(parts: { calHref: string; href: string }): boolean {
-  if (!parts.href.startsWith(parts.calHref)) return false;
-  const rest = parts.href.slice(parts.calHref.length);
+export function isMember(parts: { calHref: string; href: string }): boolean {
+  const cal = normalizeHref(parts.calHref).replace(/\/*$/, "/");
+  const href = normalizeHref(parts.href);
+  if (!href.startsWith(cal)) return false;
+  const rest = href.slice(cal.length);
   return rest.length > 0 && !rest.includes("/");
 }
 
-// Patch paths that only answer an invitation: the participation status (and
-// the reply bookkeeping around it) of one or more participants.
-const REPLY_PATH = /^participants\/[^/]+\/(participationStatus|expectReply|scheduleUpdated|scheduleSequence)$/;
+// What answering an invitation changes on a participant. An update that
+// differs from the stored event in nothing else, wherever it says so (a patch
+// path, a whole participants object, an occurrence's override), is a reply.
+const REPLY_FIELDS = new Set(["participationStatus", "expectReply", "scheduleUpdated", "scheduleSequence"]);
 
-function isReplyOnly(patch: Record<string, unknown>): boolean {
-  const keys = Object.keys(patch);
-  return keys.length > 0 && keys.every((k) => REPLY_PATH.test(k));
+function withoutReplyFields(v: unknown): unknown {
+  if (Array.isArray(v)) return v.map(withoutReplyFields);
+  if (!v || typeof v !== "object") return v;
+  const out: Record<string, unknown> = {};
+  for (const k of Object.keys(v).sort()) if (!REPLY_FIELDS.has(k)) out[k] = withoutReplyFields((v as Record<string, unknown>)[k]);
+  return out;
+}
+
+// Each occurrence as it reads, so an override that now spells out the
+// series' participants to answer for itself compares equal to one that didn't.
+function expanded(ev: JsEvent): JsEvent {
+  const base: JsEvent = { ...ev, recurrenceOverrides: null };
+  const occurrences: Record<string, unknown> = {};
+  for (const [key, patch] of Object.entries((ev.recurrenceOverrides ?? {}) as Record<string, Record<string, unknown>>)) {
+    if (patch.excluded || Object.keys(patch).length === 0) {
+      occurrences[key] = patch;
+      continue;
+    }
+    const o = structuredClone(base);
+    applyPatch(o, patch);
+    occurrences[key] = o;
+  }
+  return { ...ev, recurrenceOverrides: occurrences };
+}
+
+function isReply(before: JsEvent, after: JsEvent): boolean {
+  return JSON.stringify(withoutReplyFields(expanded(before))) === JSON.stringify(withoutReplyFields(expanded(after)));
 }
 
 export async function calendarEventSet(
@@ -643,7 +670,13 @@ export async function calendarEventSet(
       // The resource name only has to be unique in the collection; the UID is,
       // and keeping to a safe character set spares us URL-encoding questions.
       const href = `${cal.href}${uid.replace(/[^\w.@-]/g, "_")}.ics`;
-      const event: JsEvent = { ...ev, uid, sequence: 0, created: new Date().toISOString() };
+      // An imported invitation keeps the organizer's SEQUENCE and its CREATED.
+      const event: JsEvent = {
+        ...ev,
+        uid,
+        sequence: Number(ev.sequence) || 0,
+        created: typeof ev.created === "string" && !Number.isNaN(Date.parse(ev.created)) ? ev.created : new Date().toISOString(),
+      };
       await client.putEvent(href, eventToIcal(event));
       created[cid] = { id: encodeId(`${cal.href}\n${href}`), uid };
     } catch (e) {
@@ -671,6 +704,7 @@ export async function calendarEventSet(
       const p = Object.fromEntries(Object.entries(patch).filter(([k]) => !EVENT_READ_ONLY.has(k.split("/")[0]!)));
       // Compared after patching, so a path like "calendarIds/<id>" is caught too.
       const calendarIdsBefore = JSON.stringify(current.calendarIds);
+      const before = structuredClone(current);
       applyPatch(current, p);
       if (JSON.stringify(current.calendarIds) !== calendarIdsBefore) {
         throw new JmapError("invalidProperties", "moving events between calendars is not supported", { properties: ["calendarIds"] });
@@ -679,12 +713,13 @@ export async function calendarEventSet(
       // (writing an override back below its own is rejected with 412). A
       // reply alone does not: SEQUENCE belongs to the organizer (RFC 5546
       // §2.1.4), and an attendee's PARTSTAT change must leave it as it is.
-      if (!("sequence" in p)) {
-        current.sequence = Math.max(Number(current.sequence) || 0, highestSequence(res.data)) + (isReplyOnly(p) ? 0 : 1);
+      const reply = !("sequence" in p) && isReply(before, current);
+      if (!("sequence" in p) && !reply) {
+        current.sequence = Math.max(Number(current.sequence) || 0, highestSequence(res.data)) + 1;
       }
       // Without an etag there is nothing to make the write conditional on;
       // If-None-Match: * would refuse it, since the resource exists.
-      await client.putEvent(parts.href, eventToIcal(current, res.data), res.etag, { overwrite: true });
+      await client.putEvent(parts.href, eventToIcal(current, res.data, { keepSequence: reply }), res.etag, { overwrite: true });
       updated[id] = null;
     } catch (e) {
       notUpdated[id] = itemFailed("update", id, e, Object.keys(patch));

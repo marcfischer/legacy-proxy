@@ -309,3 +309,82 @@ describe("generated VTIMEZONE", () => {
     expect(out).toMatch(/BEGIN:STANDARD\r\nDTSTART:20261101T020000\r\nTZOFFSETFROM:-0230\r\nTZOFFSETTO:-0330/);
   });
 });
+
+describe("review round two", () => {
+  const instanceOnly = [
+    "BEGIN:VCALENDAR",
+    "VERSION:2.0",
+    "BEGIN:VEVENT",
+    "UID:series-9",
+    "RECURRENCE-ID;TZID=Europe/Berlin:20261012T100000",
+    "DTSTART;TZID=Europe/Berlin:20261012T100000",
+    "DTEND;TZID=Europe/Berlin:20261012T110000",
+    "SUMMARY:One of many",
+    "SEQUENCE:3",
+    "ORGANIZER:mailto:boss@example.org",
+    "ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:user@example.org",
+    "END:VEVENT",
+    "BEGIN:VEVENT",
+    "UID:series-9",
+    "RECURRENCE-ID;TZID=Europe/Berlin:20261019T100000",
+    "DTSTART;TZID=Europe/Berlin:20261019T100000",
+    "DTEND;TZID=Europe/Berlin:20261019T110000",
+    "SUMMARY:One of many",
+    "SEQUENCE:3",
+    "X-SECOND:yes",
+    "END:VEVENT",
+    "END:VCALENDAR",
+  ].join("\r\n");
+
+  it("reads occurrences stored without their series as such, and writes them back that way", () => {
+    const ev = icalToEvent(instanceOnly, "e1", "c1")!;
+    expect(ev).toMatchObject({ recurrenceId: "2026-10-12T10:00:00", recurrenceIdTimeZone: "Europe/Berlin", recurrenceRule: null, start: "2026-10-12T10:00:00" });
+    const me = Object.values(ev.participants as Record<string, Record<string, unknown>>).find((p) => p.email === "user@example.org")!;
+    me.participationStatus = "accepted";
+    const out = eventToIcal(ev, instanceOnly);
+    expect(out).toMatch(/^RECURRENCE-ID;TZID=Europe\/Berlin:20261012T100000$/m);
+    expect(out).toMatch(/^RECURRENCE-ID;TZID=Europe\/Berlin:20261019T100000$/m);
+    expect(out).toMatch(/^X-SECOND:yes$/m);
+    expect(out.slice(out.indexOf("BEGIN:VEVENT"))).not.toMatch(/^RRULE/m);
+    expect(out.match(/BEGIN:VEVENT/g)).toHaveLength(2);
+    expect(out).toMatch(/PARTSTAT=ACCEPTED/);
+
+    // An invitation like this one parses to one event per occurrence.
+    expect(icalToEvents(instanceOnly).map((e) => e.recurrenceId)).toEqual(["2026-10-12T10:00:00", "2026-10-19T10:00:00"]);
+  });
+
+  it("keeps every VEVENT without a UID in an import", () => {
+    const noUid = (n: number) => ["BEGIN:VEVENT", `DTSTART:2026100${n}T100000Z`, "DTEND:20261009T110000Z", `SUMMARY:E${n}`, "END:VEVENT"];
+    const ics = ["BEGIN:VCALENDAR", ...noUid(1), ...noUid(2), ...noUid(3), "END:VCALENDAR"].join("\r\n");
+    expect(icalToEvents(ics).map((e) => e.title)).toEqual(["E1", "E2", "E3"]);
+  });
+
+  it("names participants by address, so ids survive someone being added before them", () => {
+    const one = icalToEvent(instanceOnly.replace("SEQUENCE:3\r\nORGANIZER", "SEQUENCE:3\r\nATTENDEE:mailto:new@example.org\r\nORGANIZER"), "e", "c")!;
+    const two = icalToEvent(instanceOnly, "e", "c")!;
+    const idOf = (ev: Record<string, unknown>) => Object.entries(ev.participants as Record<string, { email: string }>).find(([, p]) => p.email === "user@example.org")![0];
+    expect(idOf(one)).toBe(idOf(two));
+  });
+
+  it("makes one participant of an ORGANIZER that is also an ATTENDEE", () => {
+    const ics = instanceOnly.replace("ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:user@example.org", "ATTENDEE;PARTSTAT=TENTATIVE:mailto:boss@example.org");
+    const ev = icalToEvent(ics, "e", "c")!;
+    const ps = Object.values(ev.participants as Record<string, Record<string, unknown>>);
+    expect(ps).toHaveLength(1);
+    expect(ps[0]).toMatchObject({ email: "boss@example.org", roles: { owner: true, attendee: true }, participationStatus: "tentative" });
+    const out = eventToIcal(ev, ics);
+    expect(out).toMatch(/^ORGANIZER.*:mailto:boss@example.org$/m);
+    expect(out).toMatch(/^ATTENDEE.*PARTSTAT=TENTATIVE.*:mailto:boss@example.org$/m);
+  });
+
+  it("writes a VTIMEZONE for an occurrence moved to another zone", () => {
+    const out = eventToIcal({
+      uid: "z", title: "x", start: "2026-10-05T10:00:00", timeZone: "Europe/Berlin", duration: "PT1H",
+      recurrenceRule: { frequency: "weekly" },
+      recurrenceOverrides: { "2026-10-12T10:00:00": { start: "2026-10-12T09:00:00", timeZone: "America/New_York" } },
+    } as never);
+    expect(out).toMatch(/^TZID:Europe\/Berlin$/m);
+    expect(out).toMatch(/^TZID:America\/New_York$/m);
+    expect(out).toMatch(/^DTSTART;TZID=America\/New_York:20261012T090000$/m);
+  });
+});

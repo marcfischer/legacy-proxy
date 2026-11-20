@@ -176,9 +176,11 @@ export class CalDavClient extends CardDavClient {
   private async memberDigest(calHref: string): Promise<string | null> {
     const xml = await this.propfind(calHref, 1, ["DAV:getetag"]);
     const members: string[] = [];
+    const self = normalizeHref(calHref).replace(/\/+$/, "");
     for (const r of splitResponses(xml)) {
       const href = extractHref(r);
-      if (!href || href === calHref) continue;
+      // The collection answers for itself too, possibly written differently.
+      if (!href || normalizeHref(href).replace(/\/+$/, "") === self || hasResourceType(r, "collection")) continue;
       const etag = textOf(r, "getetag");
       if (!etag) return null;
       members.push(`${href}\u0000${etag}`);
@@ -233,7 +235,7 @@ export class CalDavClient extends CardDavClient {
   async syncChanges(calHref: string, token: string): Promise<{ token: string; changed: string[]; removed: string[] } | null> {
     const body =
       `<?xml version="1.0" encoding="utf-8"?>\n` +
-      `<D:sync-collection xmlns:D="DAV:"><D:sync-token>${token.replace(/&/g, "&amp;").replace(/</g, "&lt;")}</D:sync-token>` +
+      `<D:sync-collection xmlns:D="DAV:"><D:sync-token>${escapeXml(token)}</D:sync-token>` +
       `<D:sync-level>1</D:sync-level><D:prop><D:getetag/></D:prop></D:sync-collection>`;
     let xml: string;
     try {
@@ -296,7 +298,7 @@ export class CalDavClient extends CardDavClient {
     const body =
       `<?xml version="1.0" encoding="utf-8"?>\n` +
       `<C:calendar-multiget ${CAL_NS}><D:prop><D:getetag/><C:calendar-data/></D:prop>` +
-      hrefs.map((h) => `<D:href>${h.replace(/&/g, "&amp;").replace(/</g, "&lt;")}</D:href>`).join("") +
+      hrefs.map((h) => `<D:href>${escapeXml(h)}</D:href>`).join("") +
       `</C:calendar-multiget>`;
     const xml = await this.request("REPORT", calHref, body, { Depth: "1" });
     // Servers may answer with a differently encoded href than we asked for
@@ -317,7 +319,8 @@ export class CalDavClient extends CardDavClient {
   }
 }
 
-function normalizeHref(href: string): string {
+/** An href as a decoded path: servers may answer with absolute URLs or encode differently. */
+export function normalizeHref(href: string): string {
   const path = href.replace(/^https?:\/\/[^/]+/i, "");
   try {
     return decodeURIComponent(path);

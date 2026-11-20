@@ -4,8 +4,9 @@
 // rules, not expanded - the client expands them itself.
 
 import { escapeValue, fold, parseLine, unescapeValue, unfold, type ParsedLine } from "../carddav/vcard.js";
-import { applyPatch } from "../jmap/methods/contacts.js";
+import { applyPatch } from "../jmap/methods/dav.js";
 import { WINDOWS_ZONES } from "./windows-zones.js";
+import crypto from "node:crypto";
 
 interface Component {
   type: string;
@@ -52,13 +53,22 @@ export function icalToEvent(text: string, id: string, calendarId: string): JsEve
  * such a file may carry any number of unrelated events.
  */
 export function icalToEvents(ics: string): JsEvent[] {
-  const byUid = new Map<string, Component[]>();
+  // A VEVENT without UID is an event of its own; grouping them under "" would
+  // keep only the first.
+  const byUid = new Map<string | symbol, Component[]>();
   for (const v of vevents(ics)) {
-    const uid = text(v, "UID") ?? "";
+    const uid = text(v, "UID") || Symbol("no uid");
     if (!byUid.has(uid)) byUid.set(uid, []);
     byUid.get(uid)!.push(v);
   }
-  return [...byUid.values()].map((group) => veventsToEvent(group, null, null)!);
+  const out: JsEvent[] = [];
+  for (const group of byUid.values()) {
+    // Without a master (an invitation to single occurrences), each instance
+    // is an event of its own, with its recurrenceId.
+    if (group.some((v) => !prop(v, "RECURRENCE-ID"))) out.push(veventsToEvent(group, null, null)!);
+    else for (const v of group) out.push(veventsToEvent([v], null, null)!);
+  }
+  return out;
 }
 
 /**
@@ -87,8 +97,8 @@ const OVERRIDE_KEYS = [
 ] as const;
 
 function veventsToEvent(vevents: Component[], id: string | null, calendarId: string | null): JsEvent | null {
-  const master = vevents.find((v) => !prop(v, "RECURRENCE-ID")) ?? vevents[0];
-  if (!master) return null;
+  const master = vevents.find((v) => !prop(v, "RECURRENCE-ID"));
+  if (!master) return vevents[0] ? instanceToEvent(vevents[0], id, calendarId) : null;
 
   const ev = eventProps(master);
   const tz = (ev.timeZone as string | null) ?? null;
@@ -140,6 +150,27 @@ function veventsToEvent(vevents: Component[], id: string | null, calendarId: str
   };
 }
 
+// A resource can hold single occurrences of a series without its master
+// (RFC 6638 §3.2.6: an attendee invited to only some instances). The first is
+// the event, with its recurrenceId (RFC 8984 §4.3.1); eventToIcal keeps the
+// others as they are.
+function instanceToEvent(v: Component, id: string | null, calendarId: string | null): JsEvent {
+  const rid = parseDate(prop(v, "RECURRENCE-ID"))!;
+  return {
+    id,
+    "@type": "Event",
+    calendarIds: calendarId === null ? null : { [calendarId]: true },
+    ...eventProps(v),
+    recurrenceId: rid.local,
+    recurrenceIdTimeZone: rid.tz ?? null,
+    recurrenceRule: null,
+    recurrenceOverrides: null,
+    excludedRecurrenceRule: null,
+    useDefaultAlerts: false,
+    isDraft: false,
+  };
+}
+
 function eventProps(v: Component): JsEvent {
   const start = parseDate(prop(v, "DTSTART"));
   const end = parseDate(prop(v, "DTEND"));
@@ -185,8 +216,16 @@ function eventProps(v: Component): JsEvent {
 const CUTYPE_TO_KIND: Record<string, string> = { INDIVIDUAL: "individual", GROUP: "group", RESOURCE: "resource", ROOM: "location" };
 const KIND_TO_CUTYPE: Record<string, string> = { individual: "INDIVIDUAL", group: "GROUP", resource: "RESOURCE", location: "ROOM" };
 
+// A participant's id comes from its address, so a patch written against one
+// version of the event still names the same person after the organizer added
+// or removed someone. ORGANIZER and ATTENDEE lines for one address are one
+// participant.
+export function participantId(email: string): string {
+  return "p" + crypto.createHash("sha1").update(email.toLowerCase()).digest("base64url").slice(0, 10);
+}
+
 function participants(v: Component): Record<string, unknown> | null {
-  const out: Record<string, unknown> = {};
+  const out: Record<string, Record<string, unknown>> = {};
   let n = 0;
   for (const p of v.props) {
     if (p.name !== "ORGANIZER" && p.name !== "ATTENDEE") continue;
@@ -203,7 +242,19 @@ function participants(v: Component): Record<string, unknown> | null {
     const kind = CUTYPE_TO_KIND[p.params.CUTYPE?.[0]?.toUpperCase() ?? ""];
     const sentBy = p.params["SENT-BY"]?.[0]?.replace(/^mailto:/i, "");
     const agent = p.params["SCHEDULE-AGENT"]?.[0]?.toLowerCase();
-    out[`p${++n}`] = {
+    n++;
+    const pid = participantId(email);
+    const seen = out[pid];
+    if (seen) {
+      // The ATTENDEE line carries the answer; the ORGANIZER line only says who owns it.
+      Object.assign(seen.roles as Record<string, boolean>, roles);
+      if (p.name === "ATTENDEE") {
+        seen.participationStatus = p.params.PARTSTAT?.[0]?.toLowerCase() ?? "needs-action";
+        if (p.params.RSVP?.[0]?.toUpperCase() === "TRUE") seen.expectReply = true;
+      }
+      continue;
+    }
+    out[pid] = {
       "@type": "Participant",
       name: p.params.CN?.[0] ?? null,
       email,
@@ -448,39 +499,64 @@ const MANAGED = new Set([
  * iCalendar body on update: its VTIMEZONEs and unmodelled master properties
  * are kept.
  */
-export function eventToIcal(ev: JsEvent, original?: string): string {
+export function eventToIcal(ev: JsEvent, original?: string, opts: { keepSequence?: boolean } = {}): string {
   const tz = typeof ev.timeZone === "string" && validZone(ev.timeZone) ? ev.timeZone : null;
   const allDay = ev.showWithoutTime === true;
   const lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Bulwark//legacy-proxy//EN", "CALSCALE:GREGORIAN"];
+  const overrides = (ev.recurrenceOverrides ?? {}) as Record<string, Record<string, unknown>>;
 
+  // Every zone a DTSTART or DTEND is written in needs its VTIMEZONE (RFC 5545
+  // §3.2.19), an occurrence moved to another zone included.
   const keptZones = original ? original.match(/BEGIN:VTIMEZONE[\s\S]*?END:VTIMEZONE\r?\n?/g) ?? [] : [];
   for (const z of keptZones) lines.push(z.replace(/\r?\n$/, ""));
-  if (tz && !allDay && !isUtc(tz) && !keptZones.some((z) => new RegExp(`^TZID:${escapeRe(tz)}\\s*$`, "m").test(z))) {
-    lines.push(...vtimezone(tz, Number(String(ev.start ?? "").slice(0, 4)) || new Date().getUTCFullYear()));
+  const year = Number(String(ev.start ?? "").slice(0, 4)) || new Date().getUTCFullYear();
+  const zones = new Set<string>();
+  if (tz && !allDay) zones.add(tz);
+  if (typeof ev.recurrenceIdTimeZone === "string" && validZone(ev.recurrenceIdTimeZone)) zones.add(ev.recurrenceIdTimeZone);
+  for (const o of Object.values(overrides)) {
+    if (typeof o.timeZone === "string" && validZone(o.timeZone) && !(o.showWithoutTime ?? allDay)) zones.add(o.timeZone);
+  }
+  for (const z of zones) {
+    if (isUtc(z) || keptZones.some((k) => new RegExp(`^TZID:${escapeRe(z)}\\s*$`, "m").test(k))) continue;
+    lines.push(...vtimezone(z, year));
   }
 
-  const masterOrig = original
-    ? parseComponents(original).flatMap((c) => c.children).find((c) => c.type === "VEVENT" && !prop(c, "RECURRENCE-ID"))
-    : undefined;
+  // A single occurrence stored without its series (see instanceToEvent) is
+  // written back with its RECURRENCE-ID; other such occurrences in the same
+  // resource stay as they were.
+  const instance = typeof ev.recurrenceId === "string" ? ev.recurrenceId : null;
+  const instanceTz = typeof ev.recurrenceIdTimeZone === "string" && validZone(ev.recurrenceIdTimeZone) ? ev.recurrenceIdTimeZone : tz;
+  const origVevents = original ? vevents(original) : [];
+  const ridOf = (c: Component) => {
+    const d = parseDate(prop(c, "RECURRENCE-ID"));
+    return d ? d.local : null;
+  };
+  const masterOrig = instance === null
+    ? origVevents.find((c) => !prop(c, "RECURRENCE-ID"))
+    : origVevents.find((c) => ridOf(c) === instance) ?? origVevents[0];
   const extra = masterOrig ? masterOrig.props.filter((p) => !MANAGED.has(p.name)).map(rawLine) : [];
 
-  const overrides = (ev.recurrenceOverrides ?? {}) as Record<string, Record<string, unknown>>;
   const exdates = Object.entries(overrides).filter(([, o]) => o.excluded).map(([k]) => dateLine("EXDATE", k, tz, allDay));
   // An added occurrence comes back as an override with an empty patch; one the
   // original had as RDATE may carry changes too. Both need their RDATE, or the
   // occurrence (and any RECURRENCE-ID written for it) is gone. RDATE on a slot
   // the rule produces as well is counted once (RFC 5545 §3.8.5.3), so writing
   // it for an untouched rule occurrence is harmless.
-  const originalRdates = new Set(masterOrig ? rdateKeys(masterOrig, tz) : []);
+  const originalRdates = new Set(masterOrig && instance === null ? rdateKeys(masterOrig, tz) : []);
   const isRdate = (k: string, o: Record<string, unknown>) => !o.excluded && (Object.keys(o).length === 0 || originalRdates.has(k));
   const rdates = Object.entries(overrides).filter(([k, o]) => isRdate(k, o)).map(([k]) => dateLine("RDATE", k, tz, allDay));
   const origParts = participantLines(masterOrig);
-  lines.push(...vevent(ev, tz, allDay, [...(ev.recurrenceRule ? [`RRULE:${rruleString(ev.recurrenceRule as Record<string, unknown>, tz, allDay)}`] : []), ...rdates, ...exdates, ...extra], undefined, origParts));
+  const rule = ev.recurrenceRule ? [`RRULE:${rruleString(ev.recurrenceRule as Record<string, unknown>, tz, allDay)}`] : [];
+  const instanceLine = instance === null ? undefined : dateLine("RECURRENCE-ID", instance, instanceTz, allDay);
+  lines.push(...vevent(ev, tz, allDay, [...rule, ...rdates, ...exdates, ...extra], instanceLine, origParts));
+  if (instance !== null) {
+    for (const c of origVevents) if (c !== masterOrig && prop(c, "RECURRENCE-ID")) lines.push(...rawComponent(c));
+  }
 
   // The stored override VEVENTs by occurrence key, for what the mapping
   // doesn't model (X- properties, parameters on its attendees).
   const origOverrides = new Map<string, Component>();
-  for (const c of original ? vevents(original) : []) {
+  for (const c of instance === null ? origVevents : []) {
     const d = parseDate(prop(c, "RECURRENCE-ID"));
     if (d) origOverrides.set(inZone(d, tz), c);
   }
@@ -491,6 +567,9 @@ export function eventToIcal(ev: JsEvent, original?: string): string {
     applyPatch(o, patch);
     const oTz = typeof o.timeZone === "string" && validZone(o.timeZone) ? o.timeZone : null;
     const own = origOverrides.get(key);
+    // A reply leaves every VEVENT at the SEQUENCE it had: it is the organizer's.
+    const ownSeq = own && prop(own, "SEQUENCE");
+    if (opts.keepSequence && ownSeq) o.sequence = Number(ownSeq.value) || 0;
     const ownExtra = own ? own.props.filter((p) => !MANAGED.has(p.name)).map(rawLine) : [];
     const ownParts = own ? new Map([...origParts, ...participantLines(own)]) : origParts;
     lines.push(...vevent(o, oTz, o.showWithoutTime === true, ownExtra, dateLine("RECURRENCE-ID", key, tz, allDay), ownParts));
@@ -637,6 +716,10 @@ function isUtc(tz: string): boolean {
 
 function compactUtc(ms: number): string {
   return new Date(ms).toISOString().replace(/[-:]/g, "").replace(/\.\d{3}/, "");
+}
+
+function rawComponent(c: Component): string[] {
+  return [`BEGIN:${c.type}`, ...c.props.map(rawLine), ...c.children.flatMap(rawComponent), `END:${c.type}`];
 }
 
 function rawLine(p: ParsedLine): string {

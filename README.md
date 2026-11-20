@@ -64,8 +64,9 @@ JMAP method coverage:
 | PushSubscription  | `get`, `set` (verification handshake, relay forwarding, expiry caps) |
 | AddressBook       | `get`, `changes`, `set` (extended MKCOL / PROPPATCH / DELETE via CardDAV) |
 | ContactCard       | `get`, `query`, `queryChanges`, `changes`, `set` (PUT / DELETE via CardDAV) |
-| Calendar          | `get` (via CalDAV; calendars can't be created or renamed yet)         |
-| CalendarEvent     | `get`, `query` (`inCalendar(s)`, `after` / `before`, `uid`), `set` (PUT / DELETE via CalDAV), `parse` (uploads and mail parts) |
+| Calendar          | `get`, `set` (MKCALENDAR / PROPPATCH / DELETE via CalDAV; no sharing) |
+| CalendarEvent     | `get`, `query` (`inCalendar(s)`, `after` / `before`, `uid`, text filters, nested `AND` / `OR`), `changes` (sync-collection), `set` (PUT / DELETE via CalDAV), `parse` (uploads and mail parts) |
+| ParticipantIdentity | `get`, `set` (the login's address plus the calendar server's `calendar-user-address-set`) |
 | CalendarEventNotification | `query`, `get` (always empty: CalDAV has no notification inbox) |
 | Quota             | `get` (stub returning empty list, so probing clients don't error)    |
 
@@ -150,6 +151,12 @@ Backends:
   VTIMEZONEs and any properties the projection doesn't model. Moving an event
   to another calendar is rejected, and the server's own scheduling decides
   whether attendees get invitations (`sendSchedulingMessages` is ignored).
+  `CalendarEvent/changes` uses `sync-collection` (RFC 6578) where a calendar
+  offers a sync token; a calendar with only a `getctag`, or with neither (then
+  a digest of its members' etags stands in), can tell that it changed but not
+  what, and the client lists it again. CalDAV has no push: while a client has
+  an event stream open, the proxy checks its calendars every
+  `CALDAV_POLL_SECONDS` and sends a `StateChange` when they moved.
 
 Auth and storage:
 

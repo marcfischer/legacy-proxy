@@ -52,6 +52,7 @@ import {
   calendarsAvailable,
   calendarEventChanges,
   calendarUserAddresses,
+  type CalendarCtx,
   calendarSet,
 } from "../jmap/methods/calendars.js";
 import { threadGet, threadChanges } from "../jmap/methods/threads.js";
@@ -70,14 +71,19 @@ export interface LegacyContext {
 
 type Handler = (args: Record<string, unknown>, ctx: LegacyContext) => Promise<unknown>;
 
+// What the CalDAV-backed handlers need: the account, its provider and the
+// mail credentials (davOptions picks a separate DAV login from them).
+async function calendarCtx(c: LegacyContext, provider = resolveProvider(c.cfg, c.account.kind)): Promise<CalendarCtx> {
+  return { account: c.account, provider, creds: await openAccountCredentials(c.cfg.vaultKey, c.account) };
+}
+
 // Aliases come from the calendar server; without one, or when it can't be
 // reached, the login's identity alone is still a valid answer.
 async function schedulingAddresses(c: LegacyContext): Promise<string[]> {
   const provider = resolveProvider(c.cfg, c.account.kind);
   if (!calendarsAvailable(provider)) return [];
   try {
-    const creds = await openAccountCredentials(c.cfg.vaultKey, c.account);
-    return await calendarUserAddresses({ account: c.account, provider, creds });
+    return await calendarUserAddresses(await calendarCtx(c, provider));
   } catch (e) {
     log.warn({ err: (e as Error).message }, "ParticipantIdentity: could not read scheduling addresses");
     return [];
@@ -189,34 +195,13 @@ function makeMethodTable(): Record<string, Handler> {
           notFound: ((a as { ids?: string[] | null }).ids ?? []) as string[],
         };
       }
-      const creds = await openAccountCredentials(c.cfg.vaultKey, c.account);
-      return calendarGet(a as never, { account: c.account, provider, creds });
+      return calendarGet(a as never, await calendarCtx(c, provider));
     },
-    "CalendarEvent/query": async (a, c) => {
-      const provider = resolveProvider(c.cfg, c.account.kind);
-      const creds = await openAccountCredentials(c.cfg.vaultKey, c.account);
-      return calendarEventQuery(a as never, { account: c.account, provider, creds });
-    },
-    "CalendarEvent/get": async (a, c) => {
-      const provider = resolveProvider(c.cfg, c.account.kind);
-      const creds = await openAccountCredentials(c.cfg.vaultKey, c.account);
-      return calendarEventGet(a as never, { account: c.account, provider, creds });
-    },
-    "Calendar/set": async (a, c) => {
-      const provider = resolveProvider(c.cfg, c.account.kind);
-      const creds = await openAccountCredentials(c.cfg.vaultKey, c.account);
-      return calendarSet(a as never, { account: c.account, provider, creds });
-    },
-    "CalendarEvent/changes": async (a, c) => {
-      const provider = resolveProvider(c.cfg, c.account.kind);
-      const creds = await openAccountCredentials(c.cfg.vaultKey, c.account);
-      return calendarEventChanges(a as never, { account: c.account, provider, creds });
-    },
-    "CalendarEvent/set": async (a, c) => {
-      const provider = resolveProvider(c.cfg, c.account.kind);
-      const creds = await openAccountCredentials(c.cfg.vaultKey, c.account);
-      return calendarEventSet(a as never, { account: c.account, provider, creds });
-    },
+    "CalendarEvent/query": async (a, c) => calendarEventQuery(a as never, await calendarCtx(c)),
+    "CalendarEvent/get": async (a, c) => calendarEventGet(a as never, await calendarCtx(c)),
+    "Calendar/set": async (a, c) => calendarSet(a as never, await calendarCtx(c)),
+    "CalendarEvent/changes": async (a, c) => calendarEventChanges(a as never, await calendarCtx(c)),
+    "CalendarEvent/set": async (a, c) => calendarEventSet(a as never, await calendarCtx(c)),
     "CalendarEvent/parse": async (a, c) =>
       calendarEventParse(a as never, { account: c.account, store: c.store, pool: c.pool }),
     "CalendarEventNotification/query": async (a, c) => calendarEventNotificationQuery(a as never, c.account),

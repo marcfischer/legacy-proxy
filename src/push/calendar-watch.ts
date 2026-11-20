@@ -2,10 +2,12 @@
 // calendars every few minutes and send a StateChange for CalendarEvent when
 // they moved, so an event added on another device shows up without a reload.
 // One PROPFIND per account and check: the calendar list with its sync tokens
-// and ctags, no event data.
+// and ctags, no event data. A calendar with neither costs one more PROPFIND
+// for its members' etags.
 
 import type { AccountRow } from "../state/store.js";
 import { log } from "../util/log.js";
+import { mapWithConcurrency } from "../util/concurrency.js";
 
 export interface CalendarWatchDeps {
   intervalMs: number;
@@ -50,21 +52,22 @@ export class CalendarWatcher {
       const open = new Set(this.deps.accounts());
       // A stream that reopens later starts from what its client got last.
       for (const id of [...this.last.keys()]) if (!open.has(id)) this.last.delete(id);
-      for (const id of open) {
+      // A few accounts at a time, so one slow DAV server doesn't hold up the round.
+      await mapWithConcurrency([...open], 4, async (id) => {
         const account = this.deps.accountById(id);
-        if (!account) continue;
+        if (!account) return;
         let state: string | null;
         try {
           state = await this.deps.stateOf(account);
         } catch (e) {
           log.warn({ accountId: id, err: (e as Error).message }, "calendar watch: check failed");
-          continue;
+          return;
         }
-        if (state === null) continue;
+        if (state === null) return;
         const before = this.last.get(id) ?? this.deps.served?.(id);
         this.last.set(id, state);
         if (before !== undefined && before !== state) this.deps.publish(account, state);
-      }
+      });
     } finally {
       this.running = false;
     }
