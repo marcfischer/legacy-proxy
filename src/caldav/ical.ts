@@ -84,6 +84,10 @@ function veventsToEvent(vevents: Component[], id: string | null, calendarId: str
   const tz = (ev.timeZone as string | null) ?? null;
   const overrides: Record<string, unknown> = {};
 
+  // RDATE adds occurrences outside the rule; JSCalendar has them as overrides
+  // whose key the rule doesn't produce (RFC 8984 §4.3.5), here empty patches.
+  // EXDATE and RECURRENCE-ID below take precedence for the same key.
+  for (const key of rdateKeys(master, tz)) overrides[key] = {};
   for (const ex of master.props.filter((p) => p.name === "EXDATE")) {
     for (const v of ex.value.split(",")) {
       const d = parseDate({ ...ex, value: v });
@@ -249,6 +253,20 @@ interface IcalDate {
   date: boolean;
 }
 
+/** The occurrences a VEVENT's RDATEs add, as LocalDateTimes in `tz`. */
+function rdateKeys(master: Component, tz: string | null): string[] {
+  const keys: string[] = [];
+  for (const rd of master.props.filter((p) => p.name === "RDATE")) {
+    for (const v of rd.value.split(",")) {
+      // VALUE=PERIOD is start/end or start/duration: the start is the slot.
+      // Its own length is not kept; the occurrence gets the event's duration.
+      const d = parseDate({ ...rd, value: v.split("/")[0]! });
+      if (d) keys.push(inZone(d, tz));
+    }
+  }
+  return keys;
+}
+
 function parseDate(p: ParsedLine | undefined): IcalDate | null {
   const m = p && /^(\d{4})(\d{2})(\d{2})(?:T(\d{2})(\d{2})(\d{2})(Z)?)?$/.exec(p.value.trim());
   if (!p || !m) return null;
@@ -375,11 +393,19 @@ export function eventToIcal(ev: JsEvent, original?: string): string {
 
   const overrides = (ev.recurrenceOverrides ?? {}) as Record<string, Record<string, unknown>>;
   const exdates = Object.entries(overrides).filter(([, o]) => o.excluded).map(([k]) => dateLine("EXDATE", k, tz, allDay));
-  lines.push(...vevent(ev, tz, allDay, [...(ev.recurrenceRule ? [`RRULE:${rruleString(ev.recurrenceRule as Record<string, unknown>, tz, allDay)}`] : []), ...exdates, ...extra]));
+  // An added occurrence comes back as an override with an empty patch; one the
+  // original had as RDATE may carry changes too. Both need their RDATE, or the
+  // occurrence (and any RECURRENCE-ID written for it) is gone. RDATE on a slot
+  // the rule produces as well is counted once (RFC 5545 §3.8.5.3), so writing
+  // it for an untouched rule occurrence is harmless.
+  const originalRdates = new Set(masterOrig ? rdateKeys(masterOrig, tz) : []);
+  const isRdate = (k: string, o: Record<string, unknown>) => !o.excluded && (Object.keys(o).length === 0 || originalRdates.has(k));
+  const rdates = Object.entries(overrides).filter(([k, o]) => isRdate(k, o)).map(([k]) => dateLine("RDATE", k, tz, allDay));
+  lines.push(...vevent(ev, tz, allDay, [...(ev.recurrenceRule ? [`RRULE:${rruleString(ev.recurrenceRule as Record<string, unknown>, tz, allDay)}`] : []), ...rdates, ...exdates, ...extra]));
 
   const base: JsEvent = { ...ev, recurrenceRule: null, recurrenceOverrides: null };
   for (const [key, patch] of Object.entries(overrides)) {
-    if (patch.excluded) continue;
+    if (patch.excluded || Object.keys(patch).length === 0) continue;
     const o = structuredClone(base);
     applyPatch(o, patch);
     const oTz = typeof o.timeZone === "string" && validZone(o.timeZone) ? o.timeZone : null;

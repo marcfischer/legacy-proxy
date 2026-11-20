@@ -140,3 +140,65 @@ describe("eventToIcal", () => {
     }
   });
 });
+
+describe("RDATE", () => {
+  const withRdates = [
+    "BEGIN:VCALENDAR",
+    "VERSION:2.0",
+    "BEGIN:VEVENT",
+    "UID:rd-1",
+    "DTSTAMP:20261001T080000Z",
+    "DTSTART;TZID=Europe/Berlin:20261005T100000",
+    "DTEND;TZID=Europe/Berlin:20261005T110000",
+    "RRULE:FREQ=WEEKLY;COUNT=3",
+    "RDATE;TZID=Europe/Berlin:20261008T140000,20261009T090000",
+    "RDATE;VALUE=PERIOD:20261010T080000Z/20261010T100000Z",
+    "SUMMARY:Kurs",
+    "END:VEVENT",
+    "END:VCALENDAR",
+  ].join("\r\n");
+
+  it("reads added occurrences as overrides with empty patches", () => {
+    const ev = icalToEvent(withRdates, "e", "c")!;
+    expect(ev.recurrenceOverrides).toEqual({
+      "2026-10-08T14:00:00": {},
+      "2026-10-09T09:00:00": {},
+      // 08:00 UTC is 10:00 in Berlin.
+      "2026-10-10T10:00:00": {},
+    });
+  });
+
+  it("keeps them when the event is saved again", () => {
+    const ev = icalToEvent(withRdates, "e", "c")!;
+    ev.title = "Kurs (neu)";
+    const again = icalToEvent(eventToIcal(ev, withRdates), "e", "c")!;
+    expect(again.title).toBe("Kurs (neu)");
+    expect(again.recurrenceOverrides).toEqual(ev.recurrenceOverrides);
+  });
+
+  it("writes an occurrence a client adds as RDATE, not as a RECURRENCE-ID copy", () => {
+    const ev = icalToEvent(withRdates, "e", "c")!;
+    (ev.recurrenceOverrides as Record<string, object>)["2026-10-20T10:00:00"] = {};
+    const out = eventToIcal(ev, withRdates);
+    expect(out).toContain("RDATE;TZID=Europe/Berlin:20261020T100000");
+    expect(out).not.toContain("RECURRENCE-ID");
+  });
+
+  it("keeps the RDATE of an added occurrence that was then changed", () => {
+    const ev = icalToEvent(withRdates, "e", "c")!;
+    (ev.recurrenceOverrides as Record<string, object>)["2026-10-08T14:00:00"] = { title: "Sondertermin" };
+    const out = eventToIcal(ev, withRdates);
+    expect(out).toContain("RDATE;TZID=Europe/Berlin:20261008T140000");
+    expect(out).toContain("RECURRENCE-ID;TZID=Europe/Berlin:20261008T140000");
+    const again = icalToEvent(out, "e", "c")!;
+    expect((again.recurrenceOverrides as Record<string, Record<string, unknown>>)["2026-10-08T14:00:00"]!.title).toBe("Sondertermin");
+  });
+
+  it("lets EXDATE remove an added occurrence", () => {
+    const ics = withRdates.replace("SUMMARY:Kurs", "EXDATE;TZID=Europe/Berlin:20261009T090000\r\nSUMMARY:Kurs");
+    const ev = icalToEvent(ics, "e", "c")!;
+    expect((ev.recurrenceOverrides as Record<string, object>)["2026-10-09T09:00:00"]).toEqual({ excluded: true });
+    const out = eventToIcal(ev, ics);
+    expect(out.match(/^RDATE.*20261009T090000/m)).toBeNull();
+  });
+});
