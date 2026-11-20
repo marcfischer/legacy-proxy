@@ -167,13 +167,29 @@ function eventProps(v: Component): JsEvent {
   };
 }
 
+// iCalendar CUTYPE / ROLE <-> JSCalendar kind / roles (RFC 8984 §4.4.6,
+// RFC 9253 for the mapping).
+const CUTYPE_TO_KIND: Record<string, string> = { INDIVIDUAL: "individual", GROUP: "group", RESOURCE: "resource", ROOM: "location" };
+const KIND_TO_CUTYPE: Record<string, string> = { individual: "INDIVIDUAL", group: "GROUP", resource: "RESOURCE", location: "ROOM" };
+
 function participants(v: Component): Record<string, unknown> | null {
   const out: Record<string, unknown> = {};
   let n = 0;
   for (const p of v.props) {
     if (p.name !== "ORGANIZER" && p.name !== "ATTENDEE") continue;
     const email = p.value.replace(/^mailto:/i, "");
-    const roles: Record<string, boolean> = p.name === "ORGANIZER" ? { owner: true } : { attendee: true };
+    const roles: Record<string, boolean> = {};
+    if (p.name === "ORGANIZER") roles.owner = true;
+    else {
+      const role = p.params.ROLE?.[0]?.toUpperCase();
+      if (role === "NON-PARTICIPANT") roles.informational = true;
+      else roles.attendee = true;
+      if (role === "CHAIR") roles.chair = true;
+      if (role === "OPT-PARTICIPANT") roles.optional = true;
+    }
+    const kind = CUTYPE_TO_KIND[p.params.CUTYPE?.[0]?.toUpperCase() ?? ""];
+    const sentBy = p.params["SENT-BY"]?.[0]?.replace(/^mailto:/i, "");
+    const agent = p.params["SCHEDULE-AGENT"]?.[0]?.toLowerCase();
     out[`p${++n}`] = {
       "@type": "Participant",
       name: p.params.CN?.[0] ?? null,
@@ -181,9 +197,53 @@ function participants(v: Component): Record<string, unknown> | null {
       calendarAddress: `mailto:${email}`,
       roles,
       participationStatus: p.params.PARTSTAT?.[0]?.toLowerCase() ?? (p.name === "ORGANIZER" ? "accepted" : "needs-action"),
+      ...(kind ? { kind } : {}),
+      ...(p.params.RSVP?.[0]?.toUpperCase() === "TRUE" ? { expectReply: true } : {}),
+      ...(sentBy ? { sentBy } : {}),
+      ...(agent ? { scheduleAgent: agent } : {}),
     };
   }
   return n ? out : null;
+}
+
+// Parameters the participant mapping writes itself; everything else on an
+// ORGANIZER / ATTENDEE line (DELEGATED-TO, LANGUAGE, X-...) is carried over
+// from the original. SCHEDULE-STATUS and SCHEDULE-FORCE-SEND belong to the
+// server and to one request respectively, so they are dropped.
+const MANAGED_PARTICIPANT_PARAMS = new Set([
+  "CN", "PARTSTAT", "ROLE", "RSVP", "CUTYPE", "SENT-BY", "SCHEDULE-AGENT", "SCHEDULE-STATUS", "SCHEDULE-FORCE-SEND",
+]);
+
+/** The original's ORGANIZER / ATTENDEE lines by "NAME address". */
+function participantLines(c: Component | undefined): Map<string, ParsedLine> {
+  const out = new Map<string, ParsedLine>();
+  for (const p of c?.props ?? []) {
+    if (p.name !== "ORGANIZER" && p.name !== "ATTENDEE") continue;
+    out.set(`${p.name} ${p.value.replace(/^mailto:/i, "").toLowerCase()}`, p);
+  }
+  return out;
+}
+
+function participantLine(name: "ORGANIZER" | "ATTENDEE", addr: string, p: Record<string, unknown>, original: ParsedLine | undefined): string {
+  // [name, value, already in wire form]
+  const params: [string, string, boolean?][] = [];
+  if (p.name) params.push(["CN", String(p.name)]);
+  for (const [k, vs] of Object.entries(original?.params ?? {})) {
+    if (!MANAGED_PARTICIPANT_PARAMS.has(k)) params.push([k, vs.map(quoteParam).join(","), true]);
+  }
+  const kind = typeof p.kind === "string" ? KIND_TO_CUTYPE[p.kind] : undefined;
+  if (kind) params.push(["CUTYPE", kind]);
+  if (typeof p.sentBy === "string" && p.sentBy) params.push(["SENT-BY", `mailto:${p.sentBy.replace(/^mailto:/i, "")}`]);
+  if (typeof p.scheduleAgent === "string" && p.scheduleAgent) params.push(["SCHEDULE-AGENT", p.scheduleAgent.toUpperCase()]);
+  if (name === "ATTENDEE") {
+    const roles = (p.roles ?? {}) as Record<string, boolean>;
+    const role = roles.chair ? "CHAIR" : roles.optional ? "OPT-PARTICIPANT" : roles.informational && !roles.attendee ? "NON-PARTICIPANT" : null;
+    if (role) params.push(["ROLE", role]);
+    if (p.expectReply === true) params.push(["RSVP", "TRUE"]);
+    const stat = typeof p.participationStatus === "string" ? p.participationStatus.toUpperCase() : "NEEDS-ACTION";
+    params.push(["PARTSTAT", stat]);
+  }
+  return `${name}${params.map(([k, v, wire]) => `;${k}=${wire ? v : quoteParam(v)}`).join("")}:mailto:${addr}`;
 }
 
 function alerts(v: Component): Record<string, unknown> | null {
@@ -401,7 +461,8 @@ export function eventToIcal(ev: JsEvent, original?: string): string {
   const originalRdates = new Set(masterOrig ? rdateKeys(masterOrig, tz) : []);
   const isRdate = (k: string, o: Record<string, unknown>) => !o.excluded && (Object.keys(o).length === 0 || originalRdates.has(k));
   const rdates = Object.entries(overrides).filter(([k, o]) => isRdate(k, o)).map(([k]) => dateLine("RDATE", k, tz, allDay));
-  lines.push(...vevent(ev, tz, allDay, [...(ev.recurrenceRule ? [`RRULE:${rruleString(ev.recurrenceRule as Record<string, unknown>, tz, allDay)}`] : []), ...rdates, ...exdates, ...extra]));
+  const origParts = participantLines(masterOrig);
+  lines.push(...vevent(ev, tz, allDay, [...(ev.recurrenceRule ? [`RRULE:${rruleString(ev.recurrenceRule as Record<string, unknown>, tz, allDay)}`] : []), ...rdates, ...exdates, ...extra], undefined, origParts));
 
   const base: JsEvent = { ...ev, recurrenceRule: null, recurrenceOverrides: null };
   for (const [key, patch] of Object.entries(overrides)) {
@@ -409,13 +470,20 @@ export function eventToIcal(ev: JsEvent, original?: string): string {
     const o = structuredClone(base);
     applyPatch(o, patch);
     const oTz = typeof o.timeZone === "string" && validZone(o.timeZone) ? o.timeZone : null;
-    lines.push(...vevent(o, oTz, o.showWithoutTime === true, [], dateLine("RECURRENCE-ID", key, tz, allDay)));
+    lines.push(...vevent(o, oTz, o.showWithoutTime === true, [], dateLine("RECURRENCE-ID", key, tz, allDay), origParts));
   }
   lines.push("END:VCALENDAR");
   return lines.map(fold).join("\r\n") + "\r\n";
 }
 
-function vevent(e: JsEvent, tz: string | null, allDay: boolean, extra: string[], recurrenceId?: string): string[] {
+function vevent(
+  e: JsEvent,
+  tz: string | null,
+  allDay: boolean,
+  extra: string[],
+  recurrenceId?: string,
+  originalParticipants?: Map<string, ParsedLine>,
+): string[] {
   const start = String(e.start ?? "");
   const out = ["BEGIN:VEVENT", `UID:${e.uid}`, `DTSTAMP:${compactUtc(Date.now())}`];
   if (recurrenceId) out.push(recurrenceId);
@@ -437,12 +505,11 @@ function vevent(e: JsEvent, tz: string | null, allDay: boolean, extra: string[],
     const send = (p.sendTo as Record<string, string> | undefined)?.imip;
     const addr = String(p.email ?? send ?? p.calendarAddress ?? "").replace(/^mailto:/i, "");
     if (!addr) continue;
-    const cn = p.name ? `;CN=${quoteParam(String(p.name))}` : "";
     const roles = (p.roles ?? {}) as Record<string, boolean>;
-    if (roles.owner) out.push(`ORGANIZER${cn}:mailto:${addr}`);
-    if (!roles.owner || roles.attendee) {
-      const stat = typeof p.participationStatus === "string" ? p.participationStatus.toUpperCase() : "NEEDS-ACTION";
-      out.push(`ATTENDEE${cn};PARTSTAT=${stat}:mailto:${addr}`);
+    const orig = (n: string) => originalParticipants?.get(`${n} ${addr.toLowerCase()}`);
+    if (roles.owner) out.push(participantLine("ORGANIZER", addr, p, orig("ORGANIZER")));
+    if (!roles.owner || roles.attendee || roles.chair || roles.optional) {
+      out.push(participantLine("ATTENDEE", addr, p, orig("ATTENDEE")));
     }
   }
 

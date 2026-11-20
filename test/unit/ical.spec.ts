@@ -202,3 +202,46 @@ describe("RDATE", () => {
     expect(out.match(/^RDATE.*20261009T090000/m)).toBeNull();
   });
 });
+
+describe("participant details", () => {
+  const invite = [
+    "BEGIN:VCALENDAR",
+    "VERSION:2.0",
+    "BEGIN:VEVENT",
+    "UID:inv-1",
+    "DTSTAMP:20261001T080000Z",
+    "DTSTART:20261007T120000Z",
+    "DTEND:20261007T130000Z",
+    "SUMMARY:Planung",
+    "ORGANIZER;CN=Chefin;SENT-BY=\"mailto:assist@example.org\":mailto:boss@example.org",
+    "ATTENDEE;CN=Marc;ROLE=REQ-PARTICIPANT;RSVP=TRUE;CUTYPE=INDIVIDUAL;PARTSTAT=NEEDS-ACTION;X-NUM-GUESTS=0:mailto:marc@example.org",
+    "ATTENDEE;CN=Bob;ROLE=OPT-PARTICIPANT;DELEGATED-TO=\"mailto:eve@example.org\";PARTSTAT=DELEGATED;SCHEDULE-STATUS=1.2:mailto:bob@example.org",
+    "ATTENDEE;CN=Raum 3;CUTYPE=ROOM;ROLE=NON-PARTICIPANT;PARTSTAT=ACCEPTED:mailto:room3@example.org",
+    "END:VEVENT",
+    "END:VCALENDAR",
+  ].join("\r\n");
+  const byEmail = (ev: Record<string, unknown>) =>
+    Object.fromEntries(Object.values(ev.participants as Record<string, Record<string, unknown>>).map((p) => [p.email, p]));
+
+  it("reads role, reply request, kind and sender", () => {
+    const p = byEmail(icalToEvent(invite, "e", "c")!);
+    expect(p["boss@example.org"]).toMatchObject({ roles: { owner: true }, sentBy: "assist@example.org" });
+    expect(p["marc@example.org"]).toMatchObject({ roles: { attendee: true }, expectReply: true, kind: "individual" });
+    expect(p["bob@example.org"]).toMatchObject({ roles: { attendee: true, optional: true }, participationStatus: "delegated" });
+    expect(p["room3@example.org"]).toMatchObject({ roles: { informational: true }, kind: "location" });
+  });
+
+  it("keeps them, and parameters it doesn't model, when the reply is saved", () => {
+    const ev = icalToEvent(invite, "e", "c")!;
+    const me = Object.values(ev.participants as Record<string, Record<string, unknown>>).find((p) => p.email === "marc@example.org")!;
+    me.participationStatus = "accepted";
+    const out = eventToIcal(ev, invite).replace(/\r\n /g, "");
+    expect(out).toContain("ORGANIZER;CN=Chefin;SENT-BY=\"mailto:assist@example.org\":mailto:boss@example.org");
+    expect(out).toMatch(/^ATTENDEE;CN=Marc;X-NUM-GUESTS=0;CUTYPE=INDIVIDUAL;RSVP=TRUE;PARTSTAT=ACCEPTED:mailto:marc@example.org$/m);
+    expect(out).toMatch(/^ATTENDEE;CN=Bob;DELEGATED-TO="mailto:eve@example.org";ROLE=OPT-PARTICIPANT;PARTSTAT=DELEGATED:mailto:bob@example.org$/m);
+    expect(out).toMatch(/^ATTENDEE;CN=Raum 3;CUTYPE=ROOM;ROLE=NON-PARTICIPANT;PARTSTAT=ACCEPTED:mailto:room3@example.org$/m);
+    // The server's own scheduling result is not sent back.
+    expect(out).not.toContain("SCHEDULE-STATUS");
+    expect(byEmail(icalToEvent(out, "e", "c")!)).toEqual(byEmail(ev));
+  });
+});
