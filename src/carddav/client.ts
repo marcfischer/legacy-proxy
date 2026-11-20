@@ -429,23 +429,24 @@ export class CardDavClient {
   async putResource(
     href: string,
     vcard: string,
-    opts: { ifMatch?: string | null; contentType?: string } = {},
+    opts: { ifMatch?: string | null; contentType?: string; overwrite?: boolean } = {},
   ): Promise<{ etag: string | null }> {
     const headers: Record<string, string> = { "Content-Type": opts.contentType ?? "text/vcard; charset=utf-8" };
     if (opts.ifMatch) headers["If-Match"] = opts.ifMatch;
-    else headers["If-None-Match"] = "*";
+    else if (!opts.overwrite) headers["If-None-Match"] = "*";
     const res = await this.raw("PUT", href, vcard, headers);
     if (res.status === 412) throw new CardDavConflict(href);
     if (!res.ok) throw await httpError("PUT", href, res);
     return { etag: res.headers.get("etag") };
   }
 
-  /** Delete a vCard resource (or an address-book collection). Missing is fine. */
-  async deleteResource(href: string, opts: { ifMatch?: string | null } = {}): Promise<void> {
+  /** Delete a vCard resource (or an address-book collection). Missing is fine unless `mustExist`. */
+  async deleteResource(href: string, opts: { ifMatch?: string | null; mustExist?: boolean } = {}): Promise<void> {
     const headers: Record<string, string> = {};
     if (opts.ifMatch) headers["If-Match"] = opts.ifMatch;
     const res = await this.raw("DELETE", href, null, headers);
     if (res.status === 412) throw new CardDavConflict(href);
+    if (res.status === 404 && opts.mustExist) throw new JmapError("notFound", "no such resource");
     if (!res.ok && res.status !== 404) throw await httpError("DELETE", href, res);
   }
 

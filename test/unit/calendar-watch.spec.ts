@@ -5,7 +5,7 @@ import { expect, it } from "vitest";
 import { CalendarWatcher } from "../../src/push/calendar-watch.js";
 import type { AccountRow } from "../../src/state/store.js";
 
-function setup() {
+function setup(served?: (id: number) => string | undefined) {
   const open = new Set<number>([1]);
   const states = new Map<number, string | null | Error>([[1, "s1"]]);
   const published: [number, string][] = [];
@@ -21,6 +21,7 @@ function setup() {
       return s ?? null;
     },
     publish: (a, s) => published.push([a.id, s]),
+    served,
   });
   return { watcher, open, states, published, checks: () => checks };
 }
@@ -57,3 +58,12 @@ it("forgets an account whose streams closed, and survives a failed check", async
   expect(published).toEqual([[1, "s3"]]);
 });
 
+
+it("pushes a change made between the client's load and the first look", async () => {
+  const { watcher, states, published } = setup((id) => (id === 1 ? "s0" : undefined));
+  states.set(1, "s1");
+  await watcher.tick();
+  expect(published).toEqual([[1, "s1"]]);
+  await watcher.tick();
+  expect(published).toHaveLength(1);
+});

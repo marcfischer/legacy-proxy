@@ -12,8 +12,10 @@ export interface CalendarWatchDeps {
   /** Accounts with an open event stream. */
   accounts: () => number[];
   accountById: (id: number) => AccountRow | undefined;
-  /** The account's current CalendarEvent state, or null when it has no calendars. */
+  /** The account's current CalendarEvent state, or null when it has no calendars or it can't be told. */
   stateOf: (account: AccountRow) => Promise<string | null>;
+  /** The state the account's client last got from a CalendarEvent method, if any. */
+  served?: (accountId: number) => string | undefined;
   publish: (account: AccountRow, state: string) => void;
 }
 
@@ -35,14 +37,18 @@ export class CalendarWatcher {
     this.timer = null;
   }
 
-  /** One round of checks. The first check of an account only records its state. */
+  /**
+   * One round of checks. The first check of an account compares against the
+   * state its client last got, so a change made between the client's load
+   * and this check is pushed too; without one it only records the state.
+   */
   async tick(): Promise<void> {
     // A slow DAV server must not stack rounds on top of each other.
     if (this.running) return;
     this.running = true;
     try {
       const open = new Set(this.deps.accounts());
-      // A stream that reopens later starts from its own fresh load.
+      // A stream that reopens later starts from what its client got last.
       for (const id of [...this.last.keys()]) if (!open.has(id)) this.last.delete(id);
       for (const id of open) {
         const account = this.deps.accountById(id);
@@ -55,7 +61,7 @@ export class CalendarWatcher {
           continue;
         }
         if (state === null) continue;
-        const before = this.last.get(id);
+        const before = this.last.get(id) ?? this.deps.served?.(id);
         this.last.set(id, state);
         if (before !== undefined && before !== state) this.deps.publish(account, state);
       }

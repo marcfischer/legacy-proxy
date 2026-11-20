@@ -34,7 +34,7 @@ import { BasicLoginCache } from "./auth/basicCache.js";
 import { PushDispatcher } from "./push/dispatcher.js";
 import { PushIdleManager } from "./push/idle.js";
 import { CalendarWatcher } from "./push/calendar-watch.js";
-import { calendarEventState, calendarsAvailable } from "./jmap/methods/calendars.js";
+import { calendarEventState, calendarsAvailable, isKnownEventState, lastServedEventState } from "./jmap/methods/calendars.js";
 
 import { loadGmailConfig } from "./gmail/config.js";
 import { GmailStore } from "./gmail/store.js";
@@ -120,8 +120,10 @@ const calendarWatcher = new CalendarWatcher({
     const provider = resolveProvider(cfg, account.kind);
     if (!calendarsAvailable(provider)) return null;
     const creds = await openAccountCredentials(cfg.vaultKey, account);
-    return calendarEventState({ account, provider, creds });
+    const state = await calendarEventState({ account, provider, creds });
+    return isKnownEventState(state) ? state : null;
   },
+  served: lastServedEventState,
   publish: (account, state) =>
     hub.publish(account, { "@type": "StateChange", changed: { [String(account.id)]: { CalendarEvent: state } } }),
 });

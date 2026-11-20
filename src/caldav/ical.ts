@@ -76,6 +76,16 @@ function vevents(ics: string): Component[] {
     .filter((c) => c.type === "VEVENT");
 }
 
+// What an override VEVENT can change for its occurrence. Anything it differs
+// in has to be in the patch: an override that came back as an empty patch is
+// written as RDATE, and its own VEVENT is gone. SEQUENCE is left out: every
+// VEVENT of a resource is written with the master's, which an update raises
+// to at least the highest stored.
+const OVERRIDE_KEYS = [
+  "start", "duration", "timeZone", "showWithoutTime", "title", "description", "locations", "status",
+  "freeBusyStatus", "privacy", "participants", "alerts",
+] as const;
+
 function veventsToEvent(vevents: Component[], id: string | null, calendarId: string | null): JsEvent | null {
   const master = vevents.find((v) => !prop(v, "RECURRENCE-ID")) ?? vevents[0];
   if (!master) return null;
@@ -99,9 +109,12 @@ function veventsToEvent(vevents: Component[], id: string | null, calendarId: str
     const d = rid && parseDate(rid);
     if (!d) continue;
     const full = eventProps(o);
+    const key = inZone(d, tz);
     const patch: Record<string, unknown> = {};
-    for (const k of ["start", "duration", "timeZone", "title", "description", "locations", "status"]) {
-      if (JSON.stringify(full[k]) !== JSON.stringify(ev[k])) patch[k] = full[k];
+    for (const k of OVERRIDE_KEYS) {
+      // An occurrence starts at its own slot unless it was moved.
+      const unchanged = k === "start" ? full.start === key : JSON.stringify(full[k]) === JSON.stringify(ev[k]);
+      if (!unchanged) patch[k] = full[k];
     }
     // Bulwark derives an occurrence's utcStart / utcEnd from its original slot
     // and prefers them over `start` for display, so a moved occurrence has to
@@ -110,7 +123,7 @@ function veventsToEvent(vevents: Component[], id: string | null, calendarId: str
       patch.utcStart = full.utcStart;
       patch.utcEnd = full.utcEnd;
     }
-    overrides[inZone(d, tz)] = patch;
+    overrides[key] = patch;
   }
 
   const rrule = prop(master, "RRULE");
@@ -464,13 +477,23 @@ export function eventToIcal(ev: JsEvent, original?: string): string {
   const origParts = participantLines(masterOrig);
   lines.push(...vevent(ev, tz, allDay, [...(ev.recurrenceRule ? [`RRULE:${rruleString(ev.recurrenceRule as Record<string, unknown>, tz, allDay)}`] : []), ...rdates, ...exdates, ...extra], undefined, origParts));
 
+  // The stored override VEVENTs by occurrence key, for what the mapping
+  // doesn't model (X- properties, parameters on its attendees).
+  const origOverrides = new Map<string, Component>();
+  for (const c of original ? vevents(original) : []) {
+    const d = parseDate(prop(c, "RECURRENCE-ID"));
+    if (d) origOverrides.set(inZone(d, tz), c);
+  }
   const base: JsEvent = { ...ev, recurrenceRule: null, recurrenceOverrides: null };
   for (const [key, patch] of Object.entries(overrides)) {
     if (patch.excluded || Object.keys(patch).length === 0) continue;
     const o = structuredClone(base);
     applyPatch(o, patch);
     const oTz = typeof o.timeZone === "string" && validZone(o.timeZone) ? o.timeZone : null;
-    lines.push(...vevent(o, oTz, o.showWithoutTime === true, [], dateLine("RECURRENCE-ID", key, tz, allDay), origParts));
+    const own = origOverrides.get(key);
+    const ownExtra = own ? own.props.filter((p) => !MANAGED.has(p.name)).map(rawLine) : [];
+    const ownParts = own ? new Map([...origParts, ...participantLines(own)]) : origParts;
+    lines.push(...vevent(o, oTz, o.showWithoutTime === true, ownExtra, dateLine("RECURRENCE-ID", key, tz, allDay), ownParts));
   }
   lines.push("END:VCALENDAR");
   return lines.map(fold).join("\r\n") + "\r\n";
@@ -574,11 +597,21 @@ function vtimezone(tz: string, year: number): string[] {
   const fmtOff = (m: number) => `${m < 0 ? "-" : "+"}${String(Math.floor(Math.abs(m) / 60)).padStart(2, "0")}${String(Math.abs(m) % 60).padStart(2, "0")}`;
   const out = ["BEGIN:VTIMEZONE", `TZID:${tz}`];
   const from = Date.UTC(year, 0, 1), to = Date.UTC(year + 1, 0, 1);
+  const DAY = 86_400_000, MINUTE = 60_000;
   let prev = off(from);
   let found = false;
-  for (let t = from + 3_600_000; t < to; t += 3_600_000) {
+  // Day by day, then narrowed to the minute: zones don't all switch on a UTC
+  // hour (America/St_Johns switches at 05:30 UTC).
+  for (let next = from + DAY; next <= to; next += DAY) {
+    if (off(next) === prev) continue;
+    let lo = next - DAY, hi = next;
+    while (hi - lo > MINUTE) {
+      const mid = lo + Math.floor((hi - lo) / 2 / MINUTE) * MINUTE;
+      if (off(mid) === prev) lo = mid;
+      else hi = mid;
+    }
+    const t = hi;
     const o = off(t);
-    if (o === prev) continue;
     const wall = new Date(t + prev * 60_000);
     const day = wall.getUTCDate();
     const dim = new Date(Date.UTC(wall.getUTCFullYear(), wall.getUTCMonth() + 1, 0)).getUTCDate();

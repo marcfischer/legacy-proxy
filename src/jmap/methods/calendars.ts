@@ -16,8 +16,7 @@ import type { Credentials } from "../../auth/credentials.js";
 import type { ProviderConfig } from "../../util/config.js";
 import type { AccountRow, Store } from "../../state/store.js";
 import type { ImapPool } from "../../imap/pool.js";
-import { withMailbox } from "../../imap/client.js";
-import { decodeBlobId, decodeEmailId } from "../../mapping/ids.js";
+import { readBlob } from "../blobs.js";
 import { accountNotFound, JmapError, unsupportedFilter } from "../errors.js";
 
 export interface CalendarCtx {
@@ -67,8 +66,10 @@ function state(cals: CalendarInfo[]): string {
 // calendar without one its ctag ("c:"). CalendarEvent/changes asks each
 // calendar with a token what changed since, without keeping anything on our
 // side; a calendar known only by ctag (mailbox.org's birthday calendar) can
-// only say "nothing" or "can't tell". Without even a ctag the state is the
-// old hash and /changes can only say cannotCalculateChanges.
+// only say "nothing" or "can't tell". The client falls back to a digest of
+// the members' etags for a calendar that has neither (see listCalendars); if
+// even that failed, the state is one that never matches, so /changes says
+// cannotCalculateChanges instead of "nothing changed".
 const SYNC_STATE_PREFIX = "S";
 
 function eventStateOf(entries: [string, string][]): string {
@@ -79,10 +80,31 @@ function versionOf(c: CalendarInfo): string | null {
   return c.syncToken ? `s:${c.syncToken}` : c.ctag ? `c:${c.ctag}` : null;
 }
 
+const UNKNOWN_STATE_PREFIX = "U";
+
 function eventState(cals: CalendarInfo[]): string {
   const versions = cals.map(versionOf);
-  if (cals.length === 0 || versions.some((v) => v === null)) return state(cals);
+  if (versions.some((v) => v === null)) return UNKNOWN_STATE_PREFIX + crypto.randomUUID();
   return eventStateOf(cals.map((c, i) => [c.href, versions[i]!]));
+}
+
+/** False for a state minted when a calendar's version couldn't be read; it changes on every read. */
+export function isKnownEventState(s: string): boolean {
+  return !s.startsWith(UNKNOWN_STATE_PREFIX);
+}
+
+// The CalendarEvent state last handed to each account's client. The watcher
+// compares against it, so a change between the client's load and the
+// watcher's first look is still pushed.
+const servedEventState = new Map<number, string>();
+
+function served(account: AccountRow, s: string): string {
+  if (isKnownEventState(s)) servedEventState.set(account.id, s);
+  return s;
+}
+
+export function lastServedEventState(accountId: number): string | undefined {
+  return servedEventState.get(accountId);
 }
 
 function decodeEventState(s: string): Map<string, string> | null {
@@ -550,7 +572,7 @@ export async function calendarEventGet(args: { accountId: string; ids?: string[]
     }
     for (const [href, id] of hrefs) if (!found.has(href)) notFound.push(id);
   });
-  return { accountId: args.accountId, state: eventState(cals), list, notFound };
+  return { accountId: args.accountId, state: served(ctx.account, eventState(cals)), list, notFound };
 }
 
 // -- CalendarEvent/set -------------------------------------------------------------
@@ -570,6 +592,23 @@ function itemFailed(op: string, id: string, e: unknown, props?: string[]): SetEr
 // Server-set or derived properties; a client sending them back is ignored
 // rather than rejected.
 const EVENT_READ_ONLY = new Set(["id", "uid", "@type", "created", "updated", "utcStart", "utcEnd", "baseEventId", "isOrigin", "isDraft"]);
+
+// An event id names a resource directly inside its calendar; anything else
+// (the calendar itself, something below or beside it) is not an event.
+function isMember(parts: { calHref: string; href: string }): boolean {
+  if (!parts.href.startsWith(parts.calHref)) return false;
+  const rest = parts.href.slice(parts.calHref.length);
+  return rest.length > 0 && !rest.includes("/");
+}
+
+// Patch paths that only answer an invitation: the participation status (and
+// the reply bookkeeping around it) of one or more participants.
+const REPLY_PATH = /^participants\/[^/]+\/(participationStatus|expectReply|scheduleUpdated|scheduleSequence)$/;
+
+function isReplyOnly(patch: Record<string, unknown>): boolean {
+  const keys = Object.keys(patch);
+  return keys.length > 0 && keys.every((k) => REPLY_PATH.test(k));
+}
 
 export async function calendarEventSet(
   args: {
@@ -624,21 +663,28 @@ export async function calendarEventSet(
     }
     try {
       const calId = encodeId(parts.calHref);
-      if (!calById.has(calId)) throw new JmapError("notFound", "no such calendar");
+      if (!calById.has(calId) || !isMember(parts)) throw new JmapError("notFound", "no such event");
       const [res] = await client.fetchEvents(parts.calHref, [parts.href]);
       const current = res && icalToEvent(res.data, id, calId);
       if (!res || !current) throw new JmapError("notFound", "no such event");
 
       const p = Object.fromEntries(Object.entries(patch).filter(([k]) => !EVENT_READ_ONLY.has(k.split("/")[0]!)));
-      if ("calendarIds" in p && JSON.stringify(p.calendarIds) !== JSON.stringify(current.calendarIds)) {
-        throw new JmapError("invalidProperties", "moving events between calendars is not supported");
-      }
+      // Compared after patching, so a path like "calendarIds/<id>" is caught too.
+      const calendarIdsBefore = JSON.stringify(current.calendarIds);
       applyPatch(current, p);
-      // Overrides are written with the master's SEQUENCE, so bump past the
-      // highest one stored: writing an override back with a lower SEQUENCE
-      // than it has is rejected with 412.
-      if (!("sequence" in p)) current.sequence = Math.max(Number(current.sequence) || 0, highestSequence(res.data)) + 1;
-      await client.putEvent(parts.href, eventToIcal(current, res.data), res.etag);
+      if (JSON.stringify(current.calendarIds) !== calendarIdsBefore) {
+        throw new JmapError("invalidProperties", "moving events between calendars is not supported", { properties: ["calendarIds"] });
+      }
+      // A change of the event bumps SEQUENCE past the highest one stored
+      // (writing an override back below its own is rejected with 412). A
+      // reply alone does not: SEQUENCE belongs to the organizer (RFC 5546
+      // §2.1.4), and an attendee's PARTSTAT change must leave it as it is.
+      if (!("sequence" in p)) {
+        current.sequence = Math.max(Number(current.sequence) || 0, highestSequence(res.data)) + (isReplyOnly(p) ? 0 : 1);
+      }
+      // Without an etag there is nothing to make the write conditional on;
+      // If-None-Match: * would refuse it, since the resource exists.
+      await client.putEvent(parts.href, eventToIcal(current, res.data), res.etag, { overwrite: true });
       updated[id] = null;
     } catch (e) {
       notUpdated[id] = itemFailed("update", id, e, Object.keys(patch));
@@ -648,7 +694,7 @@ export async function calendarEventSet(
   for (const id of args.destroy ?? []) {
     try {
       const parts = splitEventId(id);
-      if (!parts || !calById.has(encodeId(parts.calHref))) throw new JmapError("notFound", "no such event");
+      if (!parts || !calById.has(encodeId(parts.calHref)) || !isMember(parts)) throw new JmapError("notFound", "no such event");
       await client.deleteEvent(parts.href);
       destroyed.push(id);
     } catch (e) {
@@ -660,7 +706,7 @@ export async function calendarEventSet(
   return {
     accountId: args.accountId,
     oldState,
-    newState: eventState(await client.listCalendars()),
+    newState: served(ctx.account, eventState(await client.listCalendars())),
     created: orNull(created),
     updated: orNull(updated),
     destroyed: destroyed.length ? destroyed : null,
@@ -683,6 +729,7 @@ export async function calendarEventChanges(
   const cals = await client.listCalendars(true);
   const current = eventState(cals);
   const unchanged = { accountId: args.accountId, oldState: args.sinceState, newState: current, hasMoreChanges: false, created: [], updated: [], destroyed: [] };
+  served(ctx.account, current);
   if (args.sinceState === current) return unchanged;
 
   // A calendar added or removed since: its events can't be told apart as
@@ -729,6 +776,10 @@ export function calendarEventNotificationGet(args: { accountId: string; ids?: st
 
 // -- CalendarEvent/parse -----------------------------------------------------------
 
+// An invitation is a few KB and a calendar export rarely more than a few MB;
+// anything larger is not read whole.
+const MAX_PARSE_BYTES = 10 * 1024 * 1024;
+
 // Bulwark parses .ics files here in two places: its calendar import uploads
 // the file first, and the invitation banner passes the blobId of the mail's
 // text/calendar part. Parsing needs no CalDAV, only the blob's bytes.
@@ -741,57 +792,18 @@ export async function calendarEventParse(
   const notFound: string[] = [];
   const notParsable: string[] = [];
   for (const blobId of args.blobIds ?? []) {
-    const body = await readBlob(blobId, ctx);
-    if (!body) {
+    const blob = await readBlob(blobId, ctx, MAX_PARSE_BYTES);
+    if (!blob) {
       notFound.push(blobId);
       continue;
     }
-    const events = icalToEvents(body.toString("utf8"));
+    if (blob.body.length > MAX_PARSE_BYTES) {
+      notParsable.push(blobId);
+      continue;
+    }
+    const events = icalToEvents(blob.body.toString("utf8"));
     if (events.length) parsed[blobId] = events;
     else notParsable.push(blobId);
   }
   return { accountId: args.accountId, parsed, notParsable, notFound };
-}
-
-// The same lookup the download route does: uploads from SQLite, mail parts
-// from the blob cache or else an IMAP fetch. Invitations are a few KB, so we
-// buffer instead of streaming, and leave caching to the download route.
-async function readBlob(
-  blobId: string,
-  ctx: { account: AccountRow; store: Store; pool: ImapPool },
-): Promise<Buffer | null> {
-  if (blobId.startsWith("U")) return ctx.store.getUpload(blobId, ctx.account.id)?.body ?? null;
-  const cached = ctx.store.getCachedBlob(blobId, ctx.account.id);
-  if (cached) return cached.body;
-
-  let part: { emailId: string; partId: string | null };
-  let email: { mailboxIdx: number; uid: number };
-  try {
-    part = decodeBlobId(blobId);
-    email = decodeEmailId(part.emailId);
-  } catch {
-    return null;
-  }
-  const mbox = ctx.store
-    .prep(`SELECT id,name FROM mailbox WHERE id = ? AND account_id = ?`)
-    .get(email.mailboxIdx, ctx.account.id) as { id: number; name: string } | undefined;
-  if (!mbox) return null;
-
-  return ctx.pool.withConnection(ctx.account, "interactive", (client) =>
-    withMailbox(client, mbox.name, async () => {
-      const dl = await client.download(`${email.uid}`, part.partId ?? undefined, { uid: true });
-      // imapflow answers `{}` rather than null for an expunged message or part.
-      if (!dl?.content) return null;
-      const chunks: Buffer[] = [];
-      try {
-        for await (const chunk of dl.content) chunks.push(chunk as Buffer);
-      } catch (e) {
-        // Same as the download route: a FETCH that broke off mid-literal
-        // leaves the connection unparseable, so drop it rather than pool it.
-        client.close();
-        throw e;
-      }
-      return Buffer.concat(chunks);
-    }),
-  );
 }

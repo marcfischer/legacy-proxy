@@ -31,11 +31,17 @@ let collections = new Map<string, { name: string; color?: string; order?: string
 // Open-Xchange (mailbox.org): MKCALENDAR with a description is refused, and
 // description or calendar-order are answered with 200 but not kept.
 let oxQuirks = false;
+// A plain RFC 4791 server: neither sync-token nor getctag on its calendars.
+let plainServer = false;
+// Leaves getetag out of calendar-multiget answers.
+let noEtags = false;
+// Reports a removed member as "HTTP/1.1 404", without a reason phrase.
+let bareStatus = false;
 const propOf = (body: string, name: string) => new RegExp(`<[A-Z]:${name}>([^<]*)</[A-Z]:${name}>`).exec(body)?.[1];
 const logChange = (href: string, gone: boolean) => changeLog.push({ seq: ++syncSeq, href, gone });
 // Like real servers, answer with percent-encoded hrefs (`@` -> `%40`).
 const resp = (href: string, r: { data: string; etag: string }) =>
-  `<D:response><D:href>${href.replace(/@/g, "%40")}</D:href><D:propstat><D:prop><D:getetag>${r.etag}</D:getetag><C:calendar-data>${r.data.replace(/&/g, "&amp;").replace(/</g, "&lt;")}</C:calendar-data></D:prop></D:propstat></D:response>`;
+  `<D:response><D:href>${href.replace(/@/g, "%40")}</D:href><D:propstat><D:prop>${noEtags ? "" : `<D:getetag>${r.etag}</D:getetag>`}<C:calendar-data>${r.data.replace(/&/g, "&amp;").replace(/</g, "&lt;")}</C:calendar-data></D:prop></D:propstat></D:response>`;
 
 beforeEach(() => {
   resetCardDavCaches();
@@ -48,6 +54,9 @@ beforeEach(() => {
   birthdaysCtag = null;
   collections = new Map([["/cal/u/work/", { name: "Work", color: "#FF0000FF" }]]);
   oxQuirks = false;
+  plainServer = false;
+  noEtags = false;
+  bareStatus = false;
   vi.stubGlobal("fetch", async (url: string, init: RequestInit) => {
     const auth = (init.headers as Record<string, string>).Authorization;
     if (auth !== "Basic " + Buffer.from("dav-user:dav-pw").toString("base64")) return new Response("", { status: 401 });
@@ -74,9 +83,14 @@ beforeEach(() => {
           (c.color ? `<x:calendar-color xmlns:x="http://apple.com/ns/ical/">${c.color}</x:calendar-color>` : "") +
           (c.order ? `<x:calendar-order xmlns:x="http://apple.com/ns/ical/">${c.order}</x:calendar-order>` : "") +
           (c.desc ? `<C:calendar-description>${c.desc}</C:calendar-description>` : "") +
-          `<D:sync-token>http://t/${syncSeq}</D:sync-token></D:prop></D:propstat></D:response>`).join("") +
+          (plainServer ? "" : `<D:sync-token>http://t/${syncSeq}</D:sync-token>`) + `</D:prop></D:propstat></D:response>`).join("") +
         (birthdaysCtag === null ? "" : `<D:response><D:href>/cal/u/bday/</D:href><D:propstat><D:prop><D:resourcetype><D:collection/><C:calendar/></D:resourcetype><D:displayname>Birthdays</D:displayname><CS:getctag xmlns:CS="http://calendarserver.org/ns/">${birthdaysCtag}</CS:getctag></D:prop></D:propstat></D:response>`),
       );
+    if (init.method === "PROPFIND" && collections.has(path) && body.includes("getetag")) {
+      const members = [...store].filter(([h]) => h.startsWith(path));
+      return ms(`<D:response><D:href>${path}</D:href></D:response>` + members.map(([h, r]) =>
+        `<D:response><D:href>${h}</D:href><D:propstat><D:prop><D:getetag>${r.etag}</D:getetag></D:prop></D:propstat></D:response>`).join(""));
+    }
     if (init.method === "REPORT" && body.includes("sync-collection")) {
       reports.push(body);
       const since = /<D:sync-token>http:\/\/t\/(\d+)<\/D:sync-token>/.exec(body)?.[1];
@@ -84,9 +98,11 @@ beforeEach(() => {
       const latest = new Map<string, boolean>();
       for (const c of changeLog) if (c.seq > Number(since)) latest.set(c.href, c.gone);
       const items = [...latest].map(([h, gone]) =>
-        gone ? `<D:response><D:href>${h}</D:href><D:status>HTTP/1.1 404 Not Found</D:status></D:response>` : resp(h, store.get(h)!),
+        gone ? `<D:response><D:href>${h}</D:href><D:status>HTTP/1.1 404${bareStatus ? "" : " Not Found"}</D:status></D:response>` : resp(h, store.get(h)!),
       );
-      return ms(items.join("") + `<D:sync-token>http://t/${syncSeq}</D:sync-token>`);
+      // bareStatus also cuts the answer short (RFC 6578 §3.6: 507 on the collection).
+      const cut = bareStatus ? `<D:response><D:href>${path}</D:href><D:status>HTTP/1.1 507</D:status></D:response>` : "";
+      return ms(items.join("") + cut + `<D:sync-token>http://t/${syncSeq}</D:sync-token>`);
     }
     if (init.method === "REPORT") {
       reports.push(body);
@@ -254,7 +270,7 @@ it("parses uploaded .ics files and invitation parts, reporting unknown or event-
   expect(res.parsed.Uics).toHaveLength(1);
   expect(res.parsed.Uics![0]).toMatchObject({ uid: "u1", title: "Lunch & talk", utcStart: "2026-10-07T12:00:00Z", duration: "PT1H" });
   expect(res.parsed[invite]![0]).toMatchObject({ uid: "u1" });
-  expect(downloads).toEqual([["42", "2", { uid: true }]]);
+  expect(downloads).toEqual([["42", "2", { uid: true, maxBytes: 10 * 1024 * 1024 + 1 }]]);
   expect(res.notParsable).toEqual(["Utodo"]);
   expect(res.notFound).toEqual(["Umissing", gone, "garbage"]);
   await expect(calendarEventParse({ accountId: "2", blobIds: [] }, ctx)).rejects.toThrow();
@@ -451,4 +467,82 @@ it("reports what a server kept when it drops description and order", async () =>
   const upd = await calendarSet({ accountId: "1", update: { [id]: { name: "Neu", sortOrder: 3 } } }, ctx);
   expect(upd.updated![id]).toEqual({ sortOrder: 1 });
   expect((await calendarGet({ accountId: "1" }, ctx)).list[1]).toMatchObject({ name: "Neu" });
+});
+
+// -- Review fixes -----------------------------------------------------------------
+
+function plainCtx(): CalendarCtx {
+  const provider = { caldav: { host: "dav.example", port: 443, secure: true, username: "dav-user", password: "dav-pw", forUser: "mail" } } as ProviderConfig;
+  return { account: { id: 1 } as AccountRow, provider, creds: { mech: "PLAIN", username: "mail", password: "x" } };
+}
+
+it("notices a change on a server without sync-token or getctag", async () => {
+  plainServer = true;
+  const ctx = plainCtx();
+  const before = (await calendarEventGet({ accountId: "1", ids: [] }, ctx)).state;
+  store.set("/cal/u/work/2.ics", { data: EVENT.replace("UID:u1", "UID:u2"), etag: `"77"` });
+  resetCalDavCaches();
+  const after = (await calendarEventGet({ accountId: "1", ids: [] }, ctx)).state;
+  expect(after).not.toBe(before);
+  // The etag digest says that something moved, not what: the client lists again.
+  await expect(calendarEventChanges({ accountId: "1", sinceState: before }, ctx)).rejects.toMatchObject({ type: "cannotCalculateChanges" });
+  expect((await calendarEventChanges({ accountId: "1", sinceState: after }, ctx)).updated).toEqual([]);
+});
+
+it("reads a status line without a reason phrase: a 507 cut-off makes the client list again", async () => {
+  bareStatus = true;
+  const ctx = plainCtx();
+  const q = await calendarEventQuery({ accountId: "1" }, ctx);
+  const since = (await calendarEventGet({ accountId: "1", ids: q.ids }, ctx)).state;
+  store.delete("/cal/u/work/1.ics");
+  logChange("/cal/u/work/1.ics", true);
+  await expect(calendarEventChanges({ accountId: "1", sinceState: since }, ctx)).rejects.toMatchObject({ type: "cannotCalculateChanges" });
+});
+
+it("destroys only events: not the calendar, and not what isn't there", async () => {
+  const ctx = plainCtx();
+  const [id] = (await calendarEventQuery({ accountId: "1" }, ctx)).ids;
+  const enc = (s: string) => Buffer.from(s, "utf8").toString("base64url");
+  const calItself = enc("/cal/u/work/\n/cal/u/work/");
+  const elsewhere = enc("/cal/u/work/\n/cal/u/other/1.ics");
+  const missing = enc("/cal/u/work/\n/cal/u/work/nope.ics");
+  const res = await calendarEventSet({ accountId: "1", destroy: [calItself, elsewhere, missing, id!] }, ctx);
+  expect(res.destroyed).toEqual([id]);
+  expect(Object.keys(res.notDestroyed!).sort()).toEqual([calItself, elsewhere, missing].sort());
+  for (const e of Object.values(res.notDestroyed!)) expect(e.type).toBe("notFound");
+  expect(collections.has("/cal/u/work/")).toBe(true);
+});
+
+it("refuses a move between calendars given as a patch path", async () => {
+  const ctx = plainCtx();
+  const [id] = (await calendarEventQuery({ accountId: "1" }, ctx)).ids;
+  const res = await calendarEventSet({ accountId: "1", update: { [id!]: { "calendarIds/other": true } } }, ctx);
+  expect(res.notUpdated![id!]).toMatchObject({ type: "invalidProperties", properties: ["calendarIds"] });
+});
+
+it("updates an event the server listed without an etag", async () => {
+  noEtags = true;
+  const ctx = plainCtx();
+  const [id] = (await calendarEventQuery({ accountId: "1" }, ctx)).ids;
+  const res = await calendarEventSet({ accountId: "1", update: { [id!]: { title: "Renamed" } } }, ctx);
+  expect(res.updated).toEqual({ [id!]: null });
+  expect(store.get("/cal/u/work/1.ics")!.data).toContain("SUMMARY:Renamed");
+});
+
+it("leaves SEQUENCE alone for a reply and raises it for a change", async () => {
+  const ctx = plainCtx();
+  store.set("/cal/u/work/1.ics", {
+    data: EVENT.replace("SUMMARY:", "SEQUENCE:3\r\nORGANIZER:mailto:boss@example.org\r\nATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:mail@example.org\r\nSUMMARY:"),
+    etag: `"1"`,
+  });
+  const [id] = (await calendarEventQuery({ accountId: "1" }, ctx)).ids;
+  const [ev] = (await calendarEventGet({ accountId: "1", ids: [id!] }, ctx)).list;
+  const me = Object.entries(ev!.participants as Record<string, { email: string }>).find(([, p]) => p.email === "mail@example.org")![0];
+  await calendarEventSet({ accountId: "1", update: { [id!]: { [`participants/${me}/participationStatus`]: "accepted" } } }, ctx);
+  let data = store.get("/cal/u/work/1.ics")!.data;
+  expect(data).toMatch(/PARTSTAT=ACCEPTED/);
+  expect(data).toMatch(/^SEQUENCE:3$/m);
+  await calendarEventSet({ accountId: "1", update: { [id!]: { title: "Moved" } } }, ctx);
+  data = store.get("/cal/u/work/1.ics")!.data;
+  expect(data).toMatch(/^SEQUENCE:4$/m);
 });

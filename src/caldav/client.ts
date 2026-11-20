@@ -157,13 +157,33 @@ export class CalDavClient extends CardDavClient {
         description: textOf(r, "calendar-description") || null,
         // Apple's #RRGGBBAA -> #RRGGBB
         color: color ? color.slice(0, 7) : null,
-        ctag: textOf(r, "getctag") ?? textOf(r, "sync-token"),
+        // A property the server doesn't have comes back empty in a 404 propstat.
+        ctag: textOf(r, "getctag") || textOf(r, "sync-token") || null,
         syncToken: textOf(r, "sync-token") || null,
         order: Number.isFinite(Number.parseInt(textOf(r, "calendar-order") ?? "", 10)) ? Number.parseInt(textOf(r, "calendar-order")!, 10) : null,
       });
     }
+    // Neither getctag nor sync-token is required by RFC 4791. For a calendar
+    // with neither, a digest of its members' etags stands in for the ctag,
+    // so a change still moves the state. Left null if that fails too.
+    await mapWithConcurrency(out.filter((c) => !c.ctag), 4, async (c) => {
+      c.ctag = await this.memberDigest(c.href).catch(() => null);
+    });
     calListCache.set(this.cacheKey, { cals: out, at: Date.now() });
     return out;
+  }
+
+  private async memberDigest(calHref: string): Promise<string | null> {
+    const xml = await this.propfind(calHref, 1, ["DAV:getetag"]);
+    const members: string[] = [];
+    for (const r of splitResponses(xml)) {
+      const href = extractHref(r);
+      if (!href || href === calHref) continue;
+      const etag = textOf(r, "getetag");
+      if (!etag) return null;
+      members.push(`${href}\u0000${etag}`);
+    }
+    return "etags:" + crypto.createHash("sha1").update(members.sort().join("\u0000")).digest("base64url");
   }
 
   /** Hrefs of the VEVENT resources in a calendar, optionally overlapping [after, before) (UTC ms). */
@@ -230,7 +250,7 @@ export class CalDavClient extends CardDavClient {
       if (!href) continue;
       // A member's own status (no propstat) is how removal is reported; 507
       // on the collection itself means the server cut the list short.
-      const status = /<(?:[A-Za-z][\w-]*:)?propstat\b/i.test(r) ? null : /\s(\d{3})\s/.exec(textOf(r, "status") ?? "")?.[1] ?? null;
+      const status = /<(?:[A-Za-z][\w-]*:)?propstat\b/i.test(r) ? null : /\s(\d{3})(?:\s|$)/.exec(textOf(r, "status") ?? "")?.[1] ?? null;
       if (status === "507") return null;
       if (href === calHref) continue;
       if (status === "404") {
@@ -248,15 +268,20 @@ export class CalDavClient extends CardDavClient {
     return next ? { token: next, changed, removed } : null;
   }
 
-  /** PUT an iCalendar resource; same If-Match / If-None-Match rules as the CardDAV putResource. */
-  async putEvent(href: string, ics: string, ifMatch?: string | null): Promise<{ etag: string | null }> {
+  /**
+   * PUT an iCalendar resource. `ifMatch` makes the write conditional on the stored version. Without it a
+   * create sends `If-None-Match: *`; `overwrite` is for an update whose
+   * resource came without an etag, which can only be written unconditionally.
+   */
+  async putEvent(href: string, ics: string, ifMatch?: string | null, opts: { overwrite?: boolean } = {}): Promise<{ etag: string | null }> {
     this.forget(href);
-    return this.putResource(href, ics, { ifMatch, contentType: "text/calendar; charset=utf-8" });
+    return this.putResource(href, ics, { ifMatch, contentType: "text/calendar; charset=utf-8", overwrite: opts.overwrite });
   }
 
+  /** Throws notFound when the server has no such resource. */
   async deleteEvent(href: string): Promise<void> {
     this.forget(href);
-    await this.deleteResource(href);
+    await this.deleteResource(href, { mustExist: true });
   }
 
   // A write changes the calendar's ctag (and so the JMAP state) and the

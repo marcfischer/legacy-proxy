@@ -16,7 +16,7 @@ const series = [
   "LOCATION:Raum 1",
   "RRULE:FREQ=WEEKLY;INTERVAL=1;BYDAY=MO;UNTIL=20261130T090000Z",
   "EXDATE:20261012T080000Z",
-  "ORGANIZER;CN=Marc:mailto:marc@example.org",
+  "ORGANIZER;CN=Jane Doe:mailto:user@example.org",
   "ATTENDEE;PARTSTAT=ACCEPTED:mailto:bob@example.org",
   "BEGIN:VALARM",
   "ACTION:DISPLAY",
@@ -63,9 +63,13 @@ describe("icalToEvent", () => {
       alerts: { a1: { trigger: { "@type": "OffsetTrigger", offset: "-PT15M", relativeTo: "start" } } },
     });
     const parts = Object.values(ev.participants as Record<string, { email: string; roles: object }>);
-    expect(parts.map((p) => p.email)).toEqual(["marc@example.org", "bob@example.org"]);
+    expect(parts.map((p) => p.email)).toEqual(["user@example.org", "bob@example.org"]);
     // Override only carries what changed, plus its own UTC times once it moved.
-    expect(Object.keys((ev.recurrenceOverrides as Record<string, object>)["2026-10-19T10:00:00"]!)).toEqual(["start", "utcStart", "utcEnd"]);
+    // It has no ATTENDEE and no VALARM of its own, so it has neither.
+    expect((ev.recurrenceOverrides as Record<string, object>)["2026-10-19T10:00:00"]).toEqual({
+      start: "2026-10-19T14:00:00", participants: null, alerts: null,
+      utcStart: "2026-10-19T12:00:00Z", utcEnd: "2026-10-19T13:30:00Z",
+    });
   });
 
   it("maps an all-day event and skips VTODO-only resources", () => {
@@ -214,7 +218,7 @@ describe("participant details", () => {
     "DTEND:20261007T130000Z",
     "SUMMARY:Planung",
     "ORGANIZER;CN=Chefin;SENT-BY=\"mailto:assist@example.org\":mailto:boss@example.org",
-    "ATTENDEE;CN=Marc;ROLE=REQ-PARTICIPANT;RSVP=TRUE;CUTYPE=INDIVIDUAL;PARTSTAT=NEEDS-ACTION;X-NUM-GUESTS=0:mailto:marc@example.org",
+    "ATTENDEE;CN=Jane Doe;ROLE=REQ-PARTICIPANT;RSVP=TRUE;CUTYPE=INDIVIDUAL;PARTSTAT=NEEDS-ACTION;X-NUM-GUESTS=0:mailto:user@example.org",
     "ATTENDEE;CN=Bob;ROLE=OPT-PARTICIPANT;DELEGATED-TO=\"mailto:eve@example.org\";PARTSTAT=DELEGATED;SCHEDULE-STATUS=1.2:mailto:bob@example.org",
     "ATTENDEE;CN=Raum 3;CUTYPE=ROOM;ROLE=NON-PARTICIPANT;PARTSTAT=ACCEPTED:mailto:room3@example.org",
     "END:VEVENT",
@@ -226,22 +230,82 @@ describe("participant details", () => {
   it("reads role, reply request, kind and sender", () => {
     const p = byEmail(icalToEvent(invite, "e", "c")!);
     expect(p["boss@example.org"]).toMatchObject({ roles: { owner: true }, sentBy: "assist@example.org" });
-    expect(p["marc@example.org"]).toMatchObject({ roles: { attendee: true }, expectReply: true, kind: "individual" });
+    expect(p["user@example.org"]).toMatchObject({ roles: { attendee: true }, expectReply: true, kind: "individual" });
     expect(p["bob@example.org"]).toMatchObject({ roles: { attendee: true, optional: true }, participationStatus: "delegated" });
     expect(p["room3@example.org"]).toMatchObject({ roles: { informational: true }, kind: "location" });
   });
 
   it("keeps them, and parameters it doesn't model, when the reply is saved", () => {
     const ev = icalToEvent(invite, "e", "c")!;
-    const me = Object.values(ev.participants as Record<string, Record<string, unknown>>).find((p) => p.email === "marc@example.org")!;
+    const me = Object.values(ev.participants as Record<string, Record<string, unknown>>).find((p) => p.email === "user@example.org")!;
     me.participationStatus = "accepted";
     const out = eventToIcal(ev, invite).replace(/\r\n /g, "");
     expect(out).toContain("ORGANIZER;CN=Chefin;SENT-BY=\"mailto:assist@example.org\":mailto:boss@example.org");
-    expect(out).toMatch(/^ATTENDEE;CN=Marc;X-NUM-GUESTS=0;CUTYPE=INDIVIDUAL;RSVP=TRUE;PARTSTAT=ACCEPTED:mailto:marc@example.org$/m);
+    expect(out).toMatch(/^ATTENDEE;CN=Jane Doe;X-NUM-GUESTS=0;CUTYPE=INDIVIDUAL;RSVP=TRUE;PARTSTAT=ACCEPTED:mailto:user@example.org$/m);
     expect(out).toMatch(/^ATTENDEE;CN=Bob;DELEGATED-TO="mailto:eve@example.org";ROLE=OPT-PARTICIPANT;PARTSTAT=DELEGATED:mailto:bob@example.org$/m);
     expect(out).toMatch(/^ATTENDEE;CN=Raum 3;CUTYPE=ROOM;ROLE=NON-PARTICIPANT;PARTSTAT=ACCEPTED:mailto:room3@example.org$/m);
     // The server's own scheduling result is not sent back.
     expect(out).not.toContain("SCHEDULE-STATUS");
     expect(byEmail(icalToEvent(out, "e", "c")!)).toEqual(byEmail(ev));
+  });
+});
+
+describe("overrides that differ only in what the master also has", () => {
+  const accepted = [
+    "BEGIN:VCALENDAR",
+    "VERSION:2.0",
+    "BEGIN:VEVENT",
+    "UID:weekly-1",
+    "DTSTART;TZID=Europe/Berlin:20261005T100000",
+    "DTEND;TZID=Europe/Berlin:20261005T110000",
+    "RRULE:FREQ=WEEKLY",
+    "SUMMARY:Weekly",
+    "SEQUENCE:2",
+    "ORGANIZER:mailto:boss@example.org",
+    "ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:user@example.org",
+    "END:VEVENT",
+    "BEGIN:VEVENT",
+    "UID:weekly-1",
+    "RECURRENCE-ID;TZID=Europe/Berlin:20261012T100000",
+    "DTSTART;TZID=Europe/Berlin:20261012T100000",
+    "DTEND;TZID=Europe/Berlin:20261012T110000",
+    "SUMMARY:Weekly",
+    "SEQUENCE:4",
+    "X-OWN:kept",
+    "ORGANIZER:mailto:boss@example.org",
+    "ATTENDEE;PARTSTAT=ACCEPTED;X-CLIENT=phone:mailto:user@example.org",
+    "BEGIN:VALARM",
+    "ACTION:DISPLAY",
+    "TRIGGER:-PT5M",
+    "END:VALARM",
+    "END:VEVENT",
+    "END:VCALENDAR",
+  ].join("\r\n");
+
+  it("keeps an occurrence's own answer, alarm and properties when the series is edited", () => {
+    const ev = icalToEvent(accepted, "e1", "c1")!;
+    const o = (ev.recurrenceOverrides as Record<string, Record<string, unknown>>)["2026-10-12T10:00:00"]!;
+    expect(Object.keys(o).sort()).toEqual(["alerts", "participants"]);
+
+    ev.title = "Weekly sync";
+    ev.sequence = 5;
+    const out = eventToIcal(ev, accepted);
+    expect(out.match(/^RECURRENCE-ID;TZID=Europe\/Berlin:20261012T100000$/m)).toBeTruthy();
+    expect(out).not.toMatch(/^RDATE/m);
+    const override = out.slice(out.lastIndexOf("BEGIN:VEVENT"));
+    expect(override).toMatch(/^ATTENDEE;.*PARTSTAT=ACCEPTED.*:mailto:user@example.org$/m);
+    expect(override).toMatch(/X-CLIENT=phone/);
+    expect(override).toMatch(/^X-OWN:kept$/m);
+    expect(override).toMatch(/^TRIGGER:-PT5M$/m);
+    expect(override).toMatch(/^SUMMARY:Weekly sync$/m);
+    expect(override).toMatch(/^SEQUENCE:5$/m);
+  });
+});
+
+describe("generated VTIMEZONE", () => {
+  it("places a transition that isn't on a UTC hour at the right minute", () => {
+    const out = eventToIcal({ uid: "nf", title: "x", start: "2026-07-01T09:00:00", timeZone: "America/St_Johns", duration: "PT1H" } as never);
+    expect(out).toMatch(/BEGIN:DAYLIGHT\r\nDTSTART:20260308T020000\r\nTZOFFSETFROM:-0330\r\nTZOFFSETTO:-0230/);
+    expect(out).toMatch(/BEGIN:STANDARD\r\nDTSTART:20261101T020000\r\nTZOFFSETFROM:-0230\r\nTZOFFSETTO:-0330/);
   });
 });
