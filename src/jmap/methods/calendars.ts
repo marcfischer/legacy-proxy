@@ -112,10 +112,8 @@ function checkAccount(accountId: string, ctx: CalendarCtx): void {
 
 // -- Calendar/get ------------------------------------------------------------------
 
-export async function calendarGet(args: { accountId: string; ids?: string[] | null }, ctx: CalendarCtx) {
-  checkAccount(args.accountId, ctx);
-  const cals = await makeClient(ctx).listCalendars();
-  const all = cals.map((c, i) => ({
+function projectCalendar(c: CalendarInfo, i: number) {
+  return {
     id: encodeId(c.href),
     name: c.displayName,
     description: c.description,
@@ -130,7 +128,13 @@ export async function calendarGet(args: { accountId: string; ids?: string[] | nu
     timeZone: null,
     shareWith: null,
     myRights: RIGHTS,
-  }));
+  };
+}
+
+export async function calendarGet(args: { accountId: string; ids?: string[] | null }, ctx: CalendarCtx) {
+  checkAccount(args.accountId, ctx);
+  const cals = await makeClient(ctx).listCalendars();
+  const all = cals.map(projectCalendar);
   const ids = args.ids ?? null;
   return {
     accountId: args.accountId,
@@ -221,18 +225,30 @@ export async function calendarSet(
     oldState,
     newState: oldState,
     created: null as Record<string, unknown> | null,
-    updated: null as Record<string, null> | null,
+    updated: null as Record<string, Record<string, unknown> | null> | null,
     destroyed: null as string[] | null,
     notCreated: null as Record<string, unknown> | null,
     notUpdated: null as Record<string, unknown> | null,
     notDestroyed: null as Record<string, unknown> | null,
   };
 
+  // What the client asked for, to compare with what the server kept.
+  const requested = new Map<string, Record<string, unknown>>();
+  const createdHref = new Map<string, string>();
+  const known = new Set(cals.map((c) => c.href));
   for (const [tempId, raw] of Object.entries(args.create ?? {})) {
     try {
       const props = calendarPropsFrom(raw ?? {}, true);
-      const href = await client.newCalendarHref();
-      await client.makeCalendar(href, props);
+      const asked = await client.newCalendarHref();
+      // Some servers refuse a description in MKCALENDAR (Open-Xchange answers
+      // 403); it is set right after instead.
+      const { description, ...atCreate } = props;
+      await client.makeCalendar(asked, atCreate);
+      const href = await createdCalendarHref(client, asked, known, props.displayName!);
+      known.add(href);
+      if (description) await client.updateCalendarProps(href, { description });
+      requested.set(encodeId(href), raw ?? {});
+      createdHref.set(tempId, href);
       (out.created ??= {})[tempId] = { id: encodeId(href), isDefault: false, myRights: RIGHTS, ...CALENDAR_FIXED };
     } catch (e) {
       log.warn({ err: (e as Error).message, tempId }, "Calendar/set create failed");
@@ -248,6 +264,7 @@ export async function calendarSet(
         continue;
       }
       await client.updateCalendarProps(cal.href, calendarPropsFrom(patch ?? {}, false));
+      requested.set(id, patch ?? {});
       (out.updated ??= {})[id] = null;
     } catch (e) {
       log.warn({ err: (e as Error).message, id }, "Calendar/set update failed");
@@ -277,8 +294,47 @@ export async function calendarSet(
   if (out.created || out.updated || out.destroyed) {
     cals = await client.listCalendars(true);
     out.newState = state(cals);
+    // A server may accept a property and not keep it (Open-Xchange takes a
+    // description or calendar-order with 200 and drops it). RFC 8620 §5.3
+    // has the server return such values, so the client shows what is stored.
+    const kept = (id: string) => {
+      const i = cals.findIndex((c) => encodeId(c.href) === id);
+      if (i < 0) return {};
+      const now = projectCalendar(cals[i]!, i) as Record<string, unknown>;
+      const asked = requested.get(id) ?? {};
+      return Object.fromEntries(
+        [...CALENDAR_WRITABLE].filter((k) => k in asked && JSON.stringify(normalise(k, asked[k])) !== JSON.stringify(normalise(k, now[k]))).map((k) => [k, now[k]]),
+      );
+    };
+    for (const [tempId, href] of createdHref) {
+      Object.assign(out.created![tempId] as Record<string, unknown>, kept(encodeId(href)));
+    }
+    for (const id of Object.keys(out.updated ?? {})) {
+      const diff = kept(id);
+      if (Object.keys(diff).length) out.updated![id] = diff as never;
+    }
   }
   return out;
+}
+
+// Where MKCALENDAR really put the calendar. RFC 4791 creates it at the
+// request URI, but Open-Xchange files it under a folder id of its own
+// (/caldav/Y2Fs.../) and sends no Location. So: the asked href if the server
+// lists it, else the one new calendar of that name.
+async function createdCalendarHref(client: CalDavClient, asked: string, known: Set<string>, name: string): Promise<string> {
+  const now = await client.listCalendars(true);
+  if (now.some((c) => c.href === asked)) return asked;
+  const fresh = now.filter((c) => !known.has(c.href) && c.displayName === name);
+  if (fresh.length === 1) return fresh[0]!.href;
+  throw new JmapError("serverFail", "the calendar was created, but the server doesn't list it where it was asked to and it can't be told apart");
+}
+
+// Colours compare case-insensitively; an empty description is none.
+function normalise(k: string, v: unknown): unknown {
+  if (k === "color" && typeof v === "string") return v.toLowerCase();
+  if (k === "description" && (v === "" || v === undefined)) return null;
+  if (k === "name" && typeof v === "string") return v.trim();
+  return v;
 }
 
 // -- CalendarEvent/query -----------------------------------------------------------

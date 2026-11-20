@@ -28,6 +28,9 @@ let syncSeq = 0;
 let birthdaysCtag: string | null = null;
 // Calendar collections beyond "work", and what MKCALENDAR / PROPPATCH set.
 let collections = new Map<string, { name: string; color?: string; order?: string; desc?: string }>();
+// Open-Xchange (mailbox.org): MKCALENDAR with a description is refused, and
+// description or calendar-order are answered with 200 but not kept.
+let oxQuirks = false;
 const propOf = (body: string, name: string) => new RegExp(`<[A-Z]:${name}>([^<]*)</[A-Z]:${name}>`).exec(body)?.[1];
 const logChange = (href: string, gone: boolean) => changeLog.push({ seq: ++syncSeq, href, gone });
 // Like real servers, answer with percent-encoded hrefs (`@` -> `%40`).
@@ -44,10 +47,11 @@ beforeEach(() => {
   syncSeq = 0;
   birthdaysCtag = null;
   collections = new Map([["/cal/u/work/", { name: "Work", color: "#FF0000FF" }]]);
+  oxQuirks = false;
   vi.stubGlobal("fetch", async (url: string, init: RequestInit) => {
     const auth = (init.headers as Record<string, string>).Authorization;
     if (auth !== "Basic " + Buffer.from("dav-user:dav-pw").toString("base64")) return new Response("", { status: 401 });
-    const path = new URL(url).pathname;
+    let path = new URL(url).pathname;
     const body = String(init.body ?? "");
     if (init.method === "PROPFIND" && path === "/.well-known/caldav") return new Response("", { status: 301, headers: { location: "/dav/" } });
     if (init.method === "PROPFIND" && path === "/dav/" && body.includes("current-user-principal"))
@@ -91,14 +95,18 @@ beforeEach(() => {
     }
     if (init.method === "MKCALENDAR") {
       if (collections.has(path)) return new Response("", { status: 405 });
-      collections.set(path, { name: propOf(body, "displayname") ?? "", color: propOf(body, "calendar-color"), order: propOf(body, "calendar-order"), desc: propOf(body, "calendar-description") });
+      if (oxQuirks && body.includes("calendar-description")) return new Response("No folder permission.", { status: 403 });
+      // Open-Xchange files the new calendar under a folder id of its own.
+      if (oxQuirks) path = `/cal/u/ox-${collections.size}/`;
+      collections.set(path, { name: propOf(body, "displayname") ?? "", color: propOf(body, "calendar-color"), order: oxQuirks ? undefined : propOf(body, "calendar-order"), desc: propOf(body, "calendar-description") });
       return new Response(null, { status: 201 });
     }
     if (init.method === "PROPPATCH") {
       const c = collections.get(path);
       if (!c) return new Response("", { status: 404 });
       const set = body.split("<D:remove>")[0]!;
-      for (const [k, tag] of [["name", "displayname"], ["color", "calendar-color"], ["order", "calendar-order"], ["desc", "calendar-description"]] as const) {
+      const tags = [["name", "displayname"], ["color", "calendar-color"], ["order", "calendar-order"], ["desc", "calendar-description"]] as const;
+      for (const [k, tag] of tags.filter(([k]) => !oxQuirks || (k !== "order" && k !== "desc"))) {
         const v = propOf(set, tag);
         if (v !== undefined) c[k] = v;
       }
@@ -429,4 +437,18 @@ it("creates, renames, recolours, reorders and deletes calendars", async () => {
   expect((await calendarGet({ accountId: "1" }, ctx)).list.map((c) => c.name)).toEqual(["Work"]);
 
   await expect(calendarSet({ accountId: "1", onSuccessSetIsDefault: "other" }, ctx)).rejects.toMatchObject({ type: "invalidArguments" });
+});
+
+it("reports what a server kept when it drops description and order", async () => {
+  const provider = { caldav: { host: "dav.example", port: 443, secure: true, username: "dav-user", password: "dav-pw", forUser: "mail" } } as ProviderConfig;
+  const ctx: CalendarCtx = { account: { id: 1 } as AccountRow, provider, creds: { mech: "PLAIN", username: "mail", password: "x" } };
+  oxQuirks = true;
+  const made = await calendarSet({ accountId: "1", create: { n: { name: "Proxy-Test", color: "#00AA00", description: "nur Test", sortOrder: 7 } } }, ctx);
+  // Created anyway, and the client learns description and order didn't stick.
+  expect(made.created!.n).toMatchObject({ description: null, sortOrder: 1 });
+  expect(made.created!.n).not.toHaveProperty("color");
+  const id = (made.created!.n as { id: string }).id;
+  const upd = await calendarSet({ accountId: "1", update: { [id]: { name: "Neu", sortOrder: 3 } } }, ctx);
+  expect(upd.updated![id]).toEqual({ sortOrder: 1 });
+  expect((await calendarGet({ accountId: "1" }, ctx)).list[1]).toMatchObject({ name: "Neu" });
 });
