@@ -236,3 +236,77 @@ function toSetError(e: unknown): SetError {
   if (e instanceof JmapError) return e.toMethodError() as SetError;
   return { type: "serverFail", description: (e as Error).message };
 }
+
+// -- ParticipantIdentity (JMAP Calendars) --------------------------------------
+//
+// The addresses the user organises and answers events as. A client compares
+// them with an event's participants to find "me": without them Bulwark can't
+// tell which attendee to answer for. The one mail Identity is the one
+// participant identity, under the same id and with its display name.
+
+export interface ParticipantIdentityJson {
+  id: string;
+  name: string;
+  calendarAddress: string;
+  isDefault: boolean;
+}
+
+function projectParticipantIdentity(account: AccountRow, store: Store): ParticipantIdentityJson {
+  const mail = projectIdentity(account, store);
+  return { id: mail.id, name: mail.name, calendarAddress: `mailto:${mail.email}`, isDefault: true };
+}
+
+export function participantIdentityGet(
+  args: { accountId: string; ids?: string[] | null },
+  ctx: { account: AccountRow; store: Store },
+) {
+  if (args.accountId !== String(ctx.account.id)) throw accountNotFound();
+  const all = [projectParticipantIdentity(ctx.account, ctx.store)];
+  const ids = args.ids ?? null;
+  return {
+    accountId: args.accountId,
+    state: identityState(ctx.store, ctx.account.id),
+    list: ids ? all.filter((i) => ids.includes(i.id)) : all,
+    notFound: ids ? ids.filter((x) => !all.some((i) => i.id === x)) : [],
+  };
+}
+
+// There is exactly one identity and it is the default: making it the default
+// succeeds without a change, anything that would add, change or remove one
+// is refused per object.
+export function participantIdentitySet(
+  args: {
+    accountId: string;
+    create?: Record<string, unknown> | null;
+    update?: Record<string, unknown> | null;
+    destroy?: string[] | null;
+    onSuccessSetIsDefault?: string | null;
+  },
+  ctx: { account: AccountRow; store: Store },
+) {
+  if (args.accountId !== String(ctx.account.id)) throw accountNotFound();
+  const id = singletonId(ctx.account.id);
+  if (args.onSuccessSetIsDefault != null && args.onSuccessSetIsDefault !== id) {
+    throw new JmapError("invalidArguments", `no participant identity ${args.onSuccessSetIsDefault}`);
+  }
+  const forbidden = { type: "forbidden", description: "participant identities follow the mail login" };
+  const notCreated = Object.fromEntries(Object.keys(args.create ?? {}).map((k) => [k, forbidden]));
+  const notUpdated = Object.fromEntries(
+    Object.keys(args.update ?? {}).map((k) => [k, k === id ? forbidden : { type: "notFound" }]),
+  );
+  const notDestroyed = Object.fromEntries(
+    (args.destroy ?? []).map((k) => [k, k === id ? forbidden : { type: "notFound" }]),
+  );
+  const state = identityState(ctx.store, ctx.account.id);
+  return {
+    accountId: args.accountId,
+    oldState: state,
+    newState: state,
+    created: null,
+    updated: null,
+    destroyed: null,
+    notCreated: Object.keys(notCreated).length ? notCreated : null,
+    notUpdated: Object.keys(notUpdated).length ? notUpdated : null,
+    notDestroyed: Object.keys(notDestroyed).length ? notDestroyed : null,
+  };
+}

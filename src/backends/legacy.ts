@@ -21,7 +21,7 @@ import {
   emailImport,
   searchSnippetGet,
 } from "../jmap/methods/email.js";
-import { identityGet, identitySet, identityChanges } from "../jmap/methods/identity.js";
+import { identityGet, identitySet, identityChanges, participantIdentityGet, participantIdentitySet } from "../jmap/methods/identity.js";
 import {
   emailSubmissionChanges,
   emailSubmissionGet,
@@ -193,6 +193,8 @@ function makeMethodTable(): Record<string, Handler> {
       calendarEventParse(a as never, { account: c.account, store: c.store, pool: c.pool }),
     "CalendarEventNotification/query": async (a, c) => calendarEventNotificationQuery(a as never, c.account),
     "CalendarEventNotification/get": async (a, c) => calendarEventNotificationGet(a as never, c.account),
+    "ParticipantIdentity/get": async (a, c) => participantIdentityGet(a as never, { account: c.account, store: c.store }),
+    "ParticipantIdentity/set": async (a, c) => participantIdentitySet(a as never, { account: c.account, store: c.store }),
     "Mailbox/get": async (a, c) =>
       c.pool.withConnection(c.account, "interactive", (client) =>
         mailboxGet(a as never, { account: c.account, client, store: c.store }),
