@@ -405,7 +405,7 @@ export class CardDavClient {
 
   // -- low-level ----------------------------------------------------------
 
-  private async raw(
+  protected async raw(
     method: string,
     path: string,
     body: string | null,
@@ -490,7 +490,7 @@ export class CardDavConflict extends Error {
   }
 }
 
-async function httpError(method: string, path: string, res: Response): Promise<Error> {
+export async function httpError(method: string, path: string, res: Response): Promise<Error> {
   const text = await res.text().catch(() => "");
   log.warn({ method, path, status: res.status }, "carddav request failed");
   return new Error(`CardDAV ${method} ${path} → ${res.status} ${res.statusText}: ${text.slice(0, 200)}`);
@@ -527,7 +527,7 @@ function leafName(href: string): string {
   return decodeURIComponent(idx >= 0 ? trimmed.slice(idx + 1) : trimmed);
 }
 
-function escapeXml(s: string): string {
+export function escapeXml(s: string): string {
   return s
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")

@@ -9,6 +9,7 @@ import { CalDavClient, type CalendarInfo } from "../../caldav/client.js";
 import { davOptions } from "../../carddav/client.js";
 import { eventToIcal, highestSequence, icalToEvent, icalToEvents, localToUtc, type JsEvent } from "../../caldav/ical.js";
 import { applyPatch, errorFor, setError } from "./contacts.js";
+import type { CalendarProps } from "../../caldav/client.js";
 import { mapWithConcurrency } from "../../util/concurrency.js";
 import { log } from "../../util/log.js";
 import type { Credentials } from "../../auth/credentials.js";
@@ -35,7 +36,7 @@ const RIGHTS = {
   mayUpdatePrivate: true,
   mayRSVP: true,
   mayAdmin: false,
-  mayDelete: false,
+  mayDelete: true,
 };
 
 export function calendarsAvailable(provider: ProviderConfig): boolean {
@@ -119,7 +120,7 @@ export async function calendarGet(args: { accountId: string; ids?: string[] | nu
     name: c.displayName,
     description: c.description,
     color: c.color,
-    sortOrder: i,
+    sortOrder: c.order ?? i,
     isSubscribed: true,
     isVisible: true,
     isDefault: i === 0,
@@ -137,6 +138,147 @@ export async function calendarGet(args: { accountId: string; ids?: string[] | nu
     list: ids ? all.filter((c) => ids.includes(c.id)) : all,
     notFound: ids ? ids.filter((id) => !all.some((c) => c.id === id)) : [],
   };
+}
+
+// -- Calendar/set ----------------------------------------------------------------
+
+// What a calendar collection stores over CalDAV: displayname, description,
+// Apple's calendar-color and calendar-order.
+const CALENDAR_WRITABLE = new Set(["name", "description", "color", "sortOrder"]);
+// Properties Calendar/get reports with a fixed value. A client may send them
+// back (Bulwark's settings form sends the whole calendar); a different value
+// can't be kept and is refused.
+const CALENDAR_FIXED: Record<string, unknown> = {
+  isSubscribed: true,
+  isVisible: true,
+  includeInAvailability: "all",
+  defaultAlertsWithTime: null,
+  defaultAlertsWithoutTime: null,
+  timeZone: null,
+  shareWith: null,
+};
+const CALENDAR_SERVER_SET = new Set(["id", "isDefault", "myRights"]);
+
+function calendarPropsFrom(patch: Record<string, unknown>, creating: boolean): CalendarProps {
+  const bad = Object.keys(patch).filter((k) => {
+    if (CALENDAR_WRITABLE.has(k)) return false;
+    if (CALENDAR_SERVER_SET.has(k)) return creating;
+    return !(k in CALENDAR_FIXED) || JSON.stringify(patch[k]) !== JSON.stringify(CALENDAR_FIXED[k]);
+  });
+  if (bad.length) throw new JmapError("invalidProperties", `can't be set on this server: ${bad.join(", ")}`, { properties: bad });
+  const props: CalendarProps = {};
+  if ("name" in patch || creating) {
+    const name = typeof patch.name === "string" ? patch.name.trim() : "";
+    if (!name) throw new JmapError("invalidProperties", "name must be a non-empty string", { properties: ["name"] });
+    props.displayName = name;
+  }
+  if ("description" in patch) {
+    const d = patch.description;
+    if (d != null && typeof d !== "string") throw new JmapError("invalidProperties", "description must be a string or null", { properties: ["description"] });
+    props.description = d ? d : null;
+  }
+  if ("color" in patch && patch.color != null) {
+    if (typeof patch.color !== "string" || !/^#[0-9a-f]{6}$/i.test(patch.color)) {
+      throw new JmapError("invalidProperties", "color must be #RRGGBB", { properties: ["color"] });
+    }
+    props.color = patch.color;
+  }
+  if ("sortOrder" in patch) {
+    if (!Number.isInteger(patch.sortOrder) || (patch.sortOrder as number) < 0) {
+      throw new JmapError("invalidProperties", "sortOrder must be an unsigned integer", { properties: ["sortOrder"] });
+    }
+    props.order = patch.sortOrder as number;
+  }
+  return props;
+}
+
+export async function calendarSet(
+  args: {
+    accountId: string;
+    ifInState?: string | null;
+    create?: Record<string, Record<string, unknown>> | null;
+    update?: Record<string, Record<string, unknown>> | null;
+    destroy?: string[] | null;
+    onDestroyRemoveEvents?: boolean;
+    onSuccessSetIsDefault?: string | null;
+  },
+  ctx: CalendarCtx,
+) {
+  checkAccount(args.accountId, ctx);
+  const client = makeClient(ctx);
+  let cals = await client.listCalendars(true);
+  const oldState = state(cals);
+  if (args.ifInState != null && args.ifInState !== oldState) throw new JmapError("stateMismatch");
+  // The default is the first calendar the server lists; CalDAV has no
+  // portable way to change which one that is.
+  const defaultId = cals[0] ? encodeId(cals[0].href) : null;
+  if (args.onSuccessSetIsDefault != null && args.onSuccessSetIsDefault !== defaultId) {
+    throw new JmapError("invalidArguments", "the default calendar can't be changed on this server");
+  }
+
+  const out = {
+    accountId: args.accountId,
+    oldState,
+    newState: oldState,
+    created: null as Record<string, unknown> | null,
+    updated: null as Record<string, null> | null,
+    destroyed: null as string[] | null,
+    notCreated: null as Record<string, unknown> | null,
+    notUpdated: null as Record<string, unknown> | null,
+    notDestroyed: null as Record<string, unknown> | null,
+  };
+
+  for (const [tempId, raw] of Object.entries(args.create ?? {})) {
+    try {
+      const props = calendarPropsFrom(raw ?? {}, true);
+      const href = await client.newCalendarHref();
+      await client.makeCalendar(href, props);
+      (out.created ??= {})[tempId] = { id: encodeId(href), isDefault: false, myRights: RIGHTS, ...CALENDAR_FIXED };
+    } catch (e) {
+      log.warn({ err: (e as Error).message, tempId }, "Calendar/set create failed");
+      (out.notCreated ??= {})[tempId] = errorFor(e, "invalidProperties");
+    }
+  }
+
+  for (const [id, patch] of Object.entries(args.update ?? {})) {
+    try {
+      const cal = cals.find((c) => encodeId(c.href) === id);
+      if (!cal) {
+        (out.notUpdated ??= {})[id] = setError("notFound");
+        continue;
+      }
+      await client.updateCalendarProps(cal.href, calendarPropsFrom(patch ?? {}, false));
+      (out.updated ??= {})[id] = null;
+    } catch (e) {
+      log.warn({ err: (e as Error).message, id }, "Calendar/set update failed");
+      (out.notUpdated ??= {})[id] = errorFor(e, "invalidProperties");
+    }
+  }
+
+  for (const id of args.destroy ?? []) {
+    try {
+      const cal = cals.find((c) => encodeId(c.href) === id);
+      if (!cal) {
+        (out.notDestroyed ??= {})[id] = setError("notFound");
+        continue;
+      }
+      if (!args.onDestroyRemoveEvents && (await client.queryEvents(cal.href)).length > 0) {
+        (out.notDestroyed ??= {})[id] = setError("calendarHasEvent", "the calendar still has events");
+        continue;
+      }
+      await client.deleteCalendar(cal.href);
+      (out.destroyed ??= []).push(id);
+    } catch (e) {
+      log.warn({ err: (e as Error).message, id }, "Calendar/set destroy failed");
+      (out.notDestroyed ??= {})[id] = errorFor(e);
+    }
+  }
+
+  if (out.created || out.updated || out.destroyed) {
+    cals = await client.listCalendars(true);
+    out.newState = state(cals);
+  }
+  return out;
 }
 
 // -- CalendarEvent/query -----------------------------------------------------------

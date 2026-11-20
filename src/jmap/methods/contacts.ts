@@ -315,7 +315,8 @@ export function errorFor(e: unknown, fallback = "serverFail"): SetError {
   if (e instanceof CardDavConflict) {
     return setError("stateMismatch", "the resource changed on the DAV server; refetch and retry");
   }
-  if (e instanceof JmapError) return setError(e.type, e.message);
+  // Keep the error's extra fields (properties, notFound) for the client.
+  if (e instanceof JmapError) return e.toMethodError() as SetError;
   return setError(fallback, (e as Error)?.message);
 }
 

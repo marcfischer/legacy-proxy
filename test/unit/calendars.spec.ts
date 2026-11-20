@@ -4,7 +4,7 @@
 // reads blobs, not CalDAV, so it gets a fake store and IMAP pool instead.
 
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { calendarEventChanges, calendarUserAddresses, calendarEventGet, calendarEventParse, calendarEventQuery, calendarEventSet, calendarGet, type CalendarCtx } from "../../src/jmap/methods/calendars.js";
+import { calendarEventChanges, calendarSet, calendarUserAddresses, calendarEventGet, calendarEventParse, calendarEventQuery, calendarEventSet, calendarGet, type CalendarCtx } from "../../src/jmap/methods/calendars.js";
 import { resetCardDavCaches } from "../../src/carddav/client.js";
 import { resetCalDavCaches } from "../../src/caldav/client.js";
 import { Readable } from "node:stream";
@@ -26,6 +26,9 @@ let changeLog: { seq: number; href: string; gone: boolean }[] = [];
 let syncSeq = 0;
 // A second calendar with a ctag but no sync token, like mailbox.org's birthdays.
 let birthdaysCtag: string | null = null;
+// Calendar collections beyond "work", and what MKCALENDAR / PROPPATCH set.
+let collections = new Map<string, { name: string; color?: string; order?: string; desc?: string }>();
+const propOf = (body: string, name: string) => new RegExp(`<[A-Z]:${name}>([^<]*)</[A-Z]:${name}>`).exec(body)?.[1];
 const logChange = (href: string, gone: boolean) => changeLog.push({ seq: ++syncSeq, href, gone });
 // Like real servers, answer with percent-encoded hrefs (`@` -> `%40`).
 const resp = (href: string, r: { data: string; etag: string }) =>
@@ -40,6 +43,7 @@ beforeEach(() => {
   changeLog = [];
   syncSeq = 0;
   birthdaysCtag = null;
+  collections = new Map([["/cal/u/work/", { name: "Work", color: "#FF0000FF" }]]);
   vi.stubGlobal("fetch", async (url: string, init: RequestInit) => {
     const auth = (init.headers as Record<string, string>).Authorization;
     if (auth !== "Basic " + Buffer.from("dav-user:dav-pw").toString("base64")) return new Response("", { status: 401 });
@@ -61,7 +65,12 @@ beforeEach(() => {
       return ms(
         `<D:response><D:href>/cal/u/</D:href><D:propstat><D:prop><D:resourcetype><D:collection/></D:resourcetype></D:prop></D:propstat></D:response>` +
         `<D:response><D:href>/cal/u/proxy/</D:href><D:propstat><D:prop><D:resourcetype><D:collection/><C:calendar-proxy-read/></D:resourcetype></D:prop></D:propstat></D:response>` +
-        `<D:response><D:href>/cal/u/work/</D:href><D:propstat><D:prop><D:resourcetype><D:collection/><C:calendar/></D:resourcetype><D:displayname>Work</D:displayname><x:calendar-color xmlns:x="http://apple.com/ns/ical/">#FF0000FF</x:calendar-color><D:sync-token>http://t/${syncSeq}</D:sync-token></D:prop></D:propstat></D:response>` +
+        [...collections].map(([href, c]) =>
+          `<D:response><D:href>${href}</D:href><D:propstat><D:prop><D:resourcetype><D:collection/><C:calendar/></D:resourcetype><D:displayname>${c.name}</D:displayname>` +
+          (c.color ? `<x:calendar-color xmlns:x="http://apple.com/ns/ical/">${c.color}</x:calendar-color>` : "") +
+          (c.order ? `<x:calendar-order xmlns:x="http://apple.com/ns/ical/">${c.order}</x:calendar-order>` : "") +
+          (c.desc ? `<C:calendar-description>${c.desc}</C:calendar-description>` : "") +
+          `<D:sync-token>http://t/${syncSeq}</D:sync-token></D:prop></D:propstat></D:response>`).join("") +
         (birthdaysCtag === null ? "" : `<D:response><D:href>/cal/u/bday/</D:href><D:propstat><D:prop><D:resourcetype><D:collection/><C:calendar/></D:resourcetype><D:displayname>Birthdays</D:displayname><CS:getctag xmlns:CS="http://calendarserver.org/ns/">${birthdaysCtag}</CS:getctag></D:prop></D:propstat></D:response>`),
       );
     if (init.method === "REPORT" && body.includes("sync-collection")) {
@@ -79,6 +88,27 @@ beforeEach(() => {
       reports.push(body);
       const wanted = body.includes("calendar-multiget") ? [...body.matchAll(/<D:href>([^<]+)<\/D:href>/g)].map((m) => decodeURIComponent(m[1]!)) : [...store.keys()];
       return ms(wanted.filter((h) => store.has(h)).map((h) => resp(h, store.get(h)!)).join(""));
+    }
+    if (init.method === "MKCALENDAR") {
+      if (collections.has(path)) return new Response("", { status: 405 });
+      collections.set(path, { name: propOf(body, "displayname") ?? "", color: propOf(body, "calendar-color"), order: propOf(body, "calendar-order"), desc: propOf(body, "calendar-description") });
+      return new Response(null, { status: 201 });
+    }
+    if (init.method === "PROPPATCH") {
+      const c = collections.get(path);
+      if (!c) return new Response("", { status: 404 });
+      const set = body.split("<D:remove>")[0]!;
+      for (const [k, tag] of [["name", "displayname"], ["color", "calendar-color"], ["order", "calendar-order"], ["desc", "calendar-description"]] as const) {
+        const v = propOf(set, tag);
+        if (v !== undefined) c[k] = v;
+      }
+      if (body.includes("<D:remove>") && body.split("<D:remove>")[1]!.includes("calendar-description")) delete c.desc;
+      return ms(`<D:response><D:href>${path}</D:href><D:propstat><D:prop/><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>`);
+    }
+    if (init.method === "DELETE" && collections.has(path)) {
+      collections.delete(path);
+      for (const h of [...store.keys()]) if (h.startsWith(path)) store.delete(h);
+      return new Response(null, { status: 204 });
     }
     const headers = init.headers as Record<string, string>;
     if (init.method === "PUT") {
@@ -364,4 +394,39 @@ it("reads the user's scheduling addresses, preferred first, mailto only", async 
   const provider = { caldav: { host: "dav.example", port: 443, secure: true, username: "dav-user", password: "dav-pw", forUser: "mail" } } as ProviderConfig;
   const ctx: CalendarCtx = { account: { id: 1 } as AccountRow, provider, creds: { mech: "PLAIN", username: "mail", password: "x" } };
   expect(await calendarUserAddresses(ctx)).toEqual(["mail@example.org", "alias@example.org"]);
+});
+
+it("creates, renames, recolours, reorders and deletes calendars", async () => {
+  const provider = { caldav: { host: "dav.example", port: 443, secure: true, username: "dav-user", password: "dav-pw", forUser: "mail" } } as ProviderConfig;
+  const ctx: CalendarCtx = { account: { id: 1 } as AccountRow, provider, creds: { mech: "PLAIN", username: "mail", password: "x" } };
+  const made = await calendarSet({ accountId: "1", create: { n1: { name: "Proxy-Test", color: "#00aa00", description: "nur Test" } } }, ctx);
+  const id = (made.created!.n1 as { id: string }).id;
+  expect(made.newState).not.toBe(made.oldState);
+  let cals = (await calendarGet({ accountId: "1" }, ctx)).list;
+  expect(cals.find((c) => c.id === id)).toMatchObject({ name: "Proxy-Test", color: "#00aa00", description: "nur Test", isDefault: false });
+
+  // Bulwark's settings form sends the whole calendar back with the change.
+  const full = cals.find((c) => c.id === id)!;
+  const { id: _i, myRights: _r, isDefault: _d, ...editable } = full;
+  const upd = await calendarSet({ accountId: "1", update: { [id]: { ...editable, name: "Proxy-Test 2", color: "#0000ff", sortOrder: 5, description: null } } }, ctx);
+  expect(upd.updated).toEqual({ [id]: null });
+  cals = (await calendarGet({ accountId: "1" }, ctx)).list;
+  expect(cals.find((c) => c.id === id)).toMatchObject({ name: "Proxy-Test 2", color: "#0000ff", sortOrder: 5, description: null });
+
+  // What CalDAV can't keep is refused, not dropped.
+  const hidden = await calendarSet({ accountId: "1", update: { [id]: { isVisible: false } } }, ctx);
+  expect(hidden.notUpdated![id]).toMatchObject({ type: "invalidProperties", properties: ["isVisible"] });
+  const noName = await calendarSet({ accountId: "1", create: { n2: { color: "#00aa00" } } }, ctx);
+  expect(noName.notCreated!.n2).toMatchObject({ type: "invalidProperties" });
+
+  // A calendar with events stays unless the client says to remove them.
+  const work = cals.find((c) => c.name === "Work")!.id;
+  const keep = await calendarSet({ accountId: "1", destroy: [work] }, ctx);
+  expect(keep.notDestroyed![work]).toMatchObject({ type: "calendarHasEvent" });
+  const gone = await calendarSet({ accountId: "1", destroy: [id, "nope"], onDestroyRemoveEvents: true }, ctx);
+  expect(gone.destroyed).toEqual([id]);
+  expect(gone.notDestroyed).toMatchObject({ nope: { type: "notFound" } });
+  expect((await calendarGet({ accountId: "1" }, ctx)).list.map((c) => c.name)).toEqual(["Work"]);
+
+  await expect(calendarSet({ accountId: "1", onSuccessSetIsDefault: "other" }, ctx)).rejects.toMatchObject({ type: "invalidArguments" });
 });

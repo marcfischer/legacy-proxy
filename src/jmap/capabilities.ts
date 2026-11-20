@@ -77,9 +77,9 @@ export function submissionCapabilityProps() {
 }
 
 export function calendarsCapabilityProps() {
-  // CalDAV resources live in exactly one collection. Calendars can't be
-  // created through us yet, only the events in them.
-  return { maxCalendarsPerEvent: 1, mayCreateCalendar: false };
+  // CalDAV resources live in exactly one collection. Calendars are created
+  // with MKCALENDAR (Calendar/set).
+  return { maxCalendarsPerEvent: 1, mayCreateCalendar: true };
 }
 
 export function contactsCapabilityProps() {

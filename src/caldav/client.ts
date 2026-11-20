@@ -3,8 +3,9 @@
 // collection listing, the two REPORTs JMAP for Calendars needs, and event
 // PUT / DELETE.
 
+import crypto from "node:crypto";
 import {
-  CardDavClient, cachedBody, extractHref, freshEntry, hasResourceType, rememberVCard, splitResponses, textOf, type CardDavOpts,
+  CardDavClient, cachedBody, escapeXml, extractHref, freshEntry, hasResourceType, httpError, rememberVCard, splitResponses, textOf, type CardDavOpts,
 } from "../carddav/client.js";
 import { mapWithConcurrency } from "../util/concurrency.js";
 
@@ -16,6 +17,8 @@ export interface CalendarInfo {
   ctag: string | null;
   /** RFC 6578 sync token, when the server offers one. */
   syncToken: string | null;
+  /** Apple's calendar-order, the user's sort position. */
+  order: number | null;
 }
 
 export interface ICalResource {
@@ -25,6 +28,24 @@ export interface ICalResource {
 }
 
 const CAL_NS = `xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav"`;
+
+/** Collection properties Calendar/set writes; undefined = leave, description null = remove. */
+export interface CalendarProps {
+  displayName?: string;
+  description?: string | null;
+  /** #RRGGBB */
+  color?: string;
+  order?: number;
+}
+
+function calendarPropsXml(p: CalendarProps): string[] {
+  const out: string[] = [];
+  if (p.displayName !== undefined) out.push(`<D:displayname>${escapeXml(p.displayName)}</D:displayname>`);
+  if (p.description) out.push(`<C:calendar-description>${escapeXml(p.description)}</C:calendar-description>`);
+  if (p.color !== undefined) out.push(`<A:calendar-color>${escapeXml(p.color)}</A:calendar-color>`);
+  if (p.order !== undefined) out.push(`<A:calendar-order>${Math.trunc(p.order)}</A:calendar-order>`);
+  return out;
+}
 
 // Same caching scheme as the CardDAV client. A calendar load is one
 // Calendar/get plus a query and several CalendarEvent/get batches, each of
@@ -73,6 +94,44 @@ export class CalDavClient extends CardDavClient {
     return addrs;
   }
 
+  // -- calendar collections (RFC 4791 MKCALENDAR, PROPPATCH, DELETE) ----------
+
+  /** Where a new calendar goes: a fresh UUID under the calendar home. */
+  async newCalendarHref(): Promise<string> {
+    return `${await this.addressBookHome()}${crypto.randomUUID()}/`;
+  }
+
+  async makeCalendar(href: string, props: CalendarProps): Promise<void> {
+    calListCache.delete(this.cacheKey);
+    const body =
+      `<?xml version="1.0" encoding="utf-8"?>\n` +
+      `<C:mkcalendar ${CAL_NS} xmlns:A="http://apple.com/ns/ical/"><D:set><D:prop>${calendarPropsXml(props).join("")}</D:prop></D:set></C:mkcalendar>`;
+    const res = await this.raw("MKCALENDAR", href, body, { "Content-Type": "application/xml; charset=utf-8" });
+    if (!res.ok) throw await httpError("MKCALENDAR", href, res);
+  }
+
+  async updateCalendarProps(href: string, props: CalendarProps): Promise<void> {
+    const set = calendarPropsXml(props);
+    const remove = props.description === null ? [`<C:calendar-description/>`] : [];
+    if (set.length === 0 && remove.length === 0) return;
+    calListCache.delete(this.cacheKey);
+    const body =
+      `<?xml version="1.0" encoding="utf-8"?>\n` +
+      `<D:propertyupdate ${CAL_NS} xmlns:A="http://apple.com/ns/ical/">` +
+      (set.length ? `<D:set><D:prop>${set.join("")}</D:prop></D:set>` : "") +
+      (remove.length ? `<D:remove><D:prop>${remove.join("")}</D:prop></D:remove>` : "") +
+      `</D:propertyupdate>`;
+    const res = await this.raw("PROPPATCH", href, body, { "Content-Type": "application/xml; charset=utf-8" });
+    if (!res.ok && res.status !== 207) throw await httpError("PROPPATCH", href, res);
+    const text = await res.text();
+    if (/HTTP\/1\.[01] (4\d\d|5\d\d)/.test(text)) throw new Error(`CalDAV PROPPATCH ${href} → property failure: ${text.slice(0, 200)}`);
+  }
+
+  async deleteCalendar(href: string): Promise<void> {
+    calListCache.delete(this.cacheKey);
+    await this.deleteResource(href);
+  }
+
   /** `fresh` skips the short-lived list cache: change detection must see the server's current tokens. */
   async listCalendars(fresh = false): Promise<CalendarInfo[]> {
     const cached = fresh ? undefined : freshEntry(calListCache.get(this.cacheKey), CAL_LIST_TTL_MS);
@@ -85,6 +144,7 @@ export class CalDavClient extends CardDavClient {
       "http://apple.com/ns/ical/ calendar-color",
       "http://calendarserver.org/ns/ getctag",
       "DAV:sync-token",
+      "http://apple.com/ns/ical/ calendar-order",
     ]);
     const out: CalendarInfo[] = [];
     for (const r of splitResponses(xml)) {
@@ -99,6 +159,7 @@ export class CalDavClient extends CardDavClient {
         color: color ? color.slice(0, 7) : null,
         ctag: textOf(r, "getctag") ?? textOf(r, "sync-token"),
         syncToken: textOf(r, "sync-token") || null,
+        order: Number.isFinite(Number.parseInt(textOf(r, "calendar-order") ?? "", 10)) ? Number.parseInt(textOf(r, "calendar-order")!, 10) : null,
       });
     }
     calListCache.set(this.cacheKey, { cals: out, at: Date.now() });
