@@ -104,11 +104,22 @@ interface EventFilter {
   after?: string;
   before?: string;
   uid?: string;
+  text?: string;
+  title?: string;
+  description?: string;
+  location?: string;
+  owner?: string;
+  attendee?: string;
   operator?: string;
   conditions?: EventFilter[];
 }
 
-const FILTER_KEYS = new Set(["inCalendar", "inCalendars", "after", "before", "uid", "operator", "conditions"]);
+// Text conditions of the JMAP Calendars filter: case-insensitive substring
+// matches on the event (its overrides included); `text` looks in all of them.
+const TEXT_KEYS = ["text", "title", "description", "location", "owner", "attendee"] as const;
+type TextKey = (typeof TEXT_KEYS)[number];
+
+const FILTER_KEYS = new Set<string>(["inCalendar", "inCalendars", "after", "before", "uid", "operator", "conditions", ...TEXT_KEYS]);
 
 /** A filter reduced to what CalDAV can answer: calendars, a time range, a uid. */
 interface EventQueryPlan {
@@ -117,6 +128,8 @@ interface EventQueryPlan {
   after?: string;
   before?: string;
   uid?: string;
+  /** Text conditions; all must match. */
+  texts: { key: TextKey; value: string }[];
 }
 
 // Answering a filter we can't evaluate with every event is worse than failing:
@@ -130,7 +143,7 @@ interface EventQueryPlan {
 // calendars - that is how a client sends "this range, in these calendars".
 // Anything else (NOT, an OR over ranges or uids) is refused.
 function planFilter(f: EventFilter | undefined): EventQueryPlan {
-  const plan: EventQueryPlan = { calendars: null };
+  const plan: EventQueryPlan = { calendars: null, texts: [] };
   if (f) addToPlan(f, plan);
   return plan;
 }
@@ -159,6 +172,10 @@ function addToPlan(f: EventFilter, plan: EventQueryPlan): void {
   // zone compare as strings.
   if (f.after !== undefined && (plan.after === undefined || f.after > plan.after)) plan.after = f.after;
   if (f.before !== undefined && (plan.before === undefined || f.before < plan.before)) plan.before = f.before;
+  for (const key of TEXT_KEYS) {
+    const value = f[key];
+    if (typeof value === "string" && value.trim()) plan.texts.push({ key, value: value.trim().toLowerCase() });
+  }
   if (f.uid !== undefined) {
     // Two different uids can't both match; an impossible uid keeps that true.
     plan.uid = plan.uid === undefined || plan.uid === f.uid ? f.uid : "\0no-such-uid";
@@ -198,13 +215,43 @@ async function queryAll(ctx: CalendarCtx, filter?: EventFilter, timeZone?: strin
     // CalDAV has a UID prop-filter, but servers are free to ignore text
     // matches (mailbox.org does), so match on the bodies instead; they mostly
     // come from the body cache.
-    if (plan.uid !== undefined) {
+    // Text is matched the same way, CalDAV text-match being optional too.
+    if (plan.uid !== undefined || plan.texts.length) {
       const res = await client.multiGetEvents(c.href, hrefs);
-      hrefs = res.filter((r) => icalToEvent(r.data, "", "")?.uid === plan.uid).map((r) => r.href);
+      hrefs = res
+        .filter((r) => {
+          const ev = icalToEvent(r.data, "", "");
+          return !!ev && (plan.uid === undefined || ev.uid === plan.uid) && plan.texts.every((t) => matchesText(ev, t.key, t.value));
+        })
+        .map((r) => r.href);
     }
     return hrefs.map((h) => encodeId(`${c.href}\n${h}`));
   });
   return { ids: perCal.flat(), state: state(cals) };
+}
+
+/** The strings a text condition looks at, from the event and its overrides. */
+function textFields(ev: JsEvent, key: TextKey): string[] {
+  const versions: Record<string, unknown>[] = [ev, ...Object.values((ev.recurrenceOverrides ?? {}) as Record<string, Record<string, unknown>>)];
+  const out: string[] = [];
+  const people = (role: "owner" | "attendee") =>
+    Object.values((ev.participants ?? {}) as Record<string, { name?: string | null; email?: string; roles?: Record<string, boolean> }>)
+      .filter((p) => p.roles?.[role])
+      .flatMap((p) => [p.name ?? "", p.email ?? ""]);
+  for (const v of versions) {
+    if (key === "title" || key === "text") out.push(String(v.title ?? ""));
+    if (key === "description" || key === "text") out.push(String(v.description ?? ""));
+    if (key === "location" || key === "text") {
+      for (const l of Object.values((v.locations ?? {}) as Record<string, { name?: string }>)) out.push(l?.name ?? "");
+    }
+  }
+  if (key === "owner" || key === "text") out.push(...people("owner"));
+  if (key === "attendee" || key === "text") out.push(...people("attendee"));
+  return out;
+}
+
+function matchesText(ev: JsEvent, key: TextKey, needle: string): boolean {
+  return textFields(ev, key).some((s) => s.toLowerCase().includes(needle));
 }
 
 export async function calendarEventQuery(

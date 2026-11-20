@@ -104,7 +104,7 @@ it("filters by uid and refuses filters it can't evaluate", async () => {
   expect(ev!.uid).toBe("u2");
   expect((await calendarEventQuery({ accountId: "1", filter: { uid: "nope" } }, ctx)).ids).toEqual([]);
 
-  await expect(calendarEventQuery({ accountId: "1", filter: { title: "Lunch" } as never }, ctx)).rejects.toMatchObject({ type: "unsupportedFilter" });
+  await expect(calendarEventQuery({ accountId: "1", filter: { priority: 1 } as never }, ctx)).rejects.toMatchObject({ type: "unsupportedFilter" });
   await expect(calendarEventQuery({ accountId: "1", filter: { operator: "OR", conditions: [{ uid: "u1" }] } as never }, ctx)).rejects.toMatchObject({ type: "unsupportedFilter" });
 });
 
@@ -238,4 +238,41 @@ it("refuses NOT and an OR over anything but calendars", async () => {
   ]) {
     await expect(calendarEventQuery({ accountId: "1", filter: filter as never }, ctx)).rejects.toMatchObject({ type: "unsupportedFilter" });
   }
+});
+
+it("finds events by text in title, description, location and people", async () => {
+  const provider = { caldav: { host: "dav.example", port: 443, secure: true, username: "dav-user", password: "dav-pw", forUser: "mail" } } as ProviderConfig;
+  const ctx: CalendarCtx = { account: { id: 1 } as AccountRow, provider, creds: { mech: "PLAIN", username: "mail", password: "x" } };
+  store.set(
+    "/cal/u/work/2.ics",
+    {
+      data: EVENT.replace("UID:u1", "UID:u2")
+        .replace("SUMMARY:Lunch & talk", "SUMMARY:Steuerberater\r\nLOCATION:Kanzlei Nord\r\nATTENDEE;CN=Frau Weber:mailto:weber@kanzlei.example"),
+      etag: `"9"`,
+    },
+  );
+  const uidsFor = async (filter: object) => {
+    const q = await calendarEventQuery({ accountId: "1", filter: filter as never }, ctx);
+    const got = await calendarEventGet({ accountId: "1", ids: q.ids }, ctx);
+    return got.list.map((e) => e.uid).sort();
+  };
+
+  expect(await uidsFor({ text: "lunch" })).toEqual(["u1"]);
+  expect(await uidsFor({ text: "KANZLEI" })).toEqual(["u2"]);
+  expect(await uidsFor({ text: "weber" })).toEqual(["u2"]);
+  expect(await uidsFor({ title: "kanzlei" })).toEqual([]);
+  expect(await uidsFor({ location: "nord" })).toEqual(["u2"]);
+  expect(await uidsFor({ attendee: "weber@" })).toEqual(["u2"]);
+  // Global search: bounds and several words as an AND of one-key conditions.
+  expect(
+    await uidsFor({
+      operator: "AND",
+      conditions: [{ after: "2026-10-01T00:00:00" }, { before: "2026-11-01T00:00:00" }, { text: "steuer" }, { text: "nord" }],
+    }),
+  ).toEqual(["u2"]);
+  expect(await uidsFor({ operator: "AND", conditions: [{ text: "steuer" }, { text: "lunch" }] })).toEqual([]);
+
+  await expect(
+    calendarEventQuery({ accountId: "1", filter: { operator: "OR", conditions: [{ text: "a" }, { text: "b" }] } as never }, ctx),
+  ).rejects.toMatchObject({ type: "unsupportedFilter" });
 });
