@@ -164,6 +164,7 @@ async function cachedSearch(
   cacheKey: string,
   imapFilter: ReturnType<typeof compileFilter>,
   wasOpen: boolean,
+  onSearched?: (uids: number[]) => void,
 ): Promise<number[]> {
   const emailState = store.getState(accountId, "email");
   const cached = searchCache.get(cacheKey);
@@ -173,6 +174,7 @@ async function cachedSearch(
   if (wasOpen) await client.noop();
   const searchResult = await client.search(imapFilter, { uid: true });
   const uids = Array.isArray(searchResult) ? (searchResult as number[]) : [];
+  onSearched?.(uids);
   searchCache.set(cacheKey, {
     uids,
     modseq: openModseq(client),
@@ -215,6 +217,7 @@ function rememberFolderSearch(key: string, modseq: number | undefined, uids: num
   }
 }
 
+/** Forget every folder search result (tests start each from scratch). */
 export function resetFolderSearchCache(): void {
   folderSearchCache.clear();
 }
@@ -737,8 +740,11 @@ async function emailQueryAccountWideFull(
       );
 
       const cacheKey = searchCacheKey(ctx.account.id, idx, uidvalidity, filter);
-      const uids = await cachedSearch(client, ctx.store, ctx.account.id, cacheKey, imapFilter, wasOpen);
-      if (liveBefore && liveBefore.uidValidity === uidvalidity) rememberFolderSearch(cacheKey, liveBefore.highestModseq, uids);
+      // Only a SEARCH that just ran vouches for the modseq read before it; a
+      // searchCache hit may be older than that.
+      const uids = await cachedSearch(client, ctx.store, ctx.account.id, cacheKey, imapFilter, wasOpen, (found) => {
+        if (liveBefore && liveBefore.uidValidity === uidvalidity) rememberFolderSearch(cacheKey, liveBefore.highestModseq, found);
+      });
       if (uids.length === 0) return;
 
       // Cross-folder merge needs receivedAt for every hit. Prefer the

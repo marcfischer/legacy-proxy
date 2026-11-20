@@ -2,7 +2,7 @@
 // Junk, as label counters send it) searches only the folders whose
 // HIGHESTMODSEQ moved since their last search.
 
-import { afterEach, beforeEach, expect, it } from "vitest";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -22,6 +22,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   store.db.close();
   rmSync(dir, { recursive: true, force: true });
 });
@@ -58,7 +59,10 @@ function fakeServer(folders: Record<string, Folder>) {
       let release!: () => void;
       held = new Promise<void>((r) => (release = r));
       await prev;
-      client.mailbox = { path: p, uidValidity: 7n, highestModseq: BigInt(folders[p]!.modseq ?? 0) };
+      // An already selected folder keeps the view (and modseq) it had until a NOOP.
+      if ((client.mailbox as { path?: string }).path !== p) {
+        client.mailbox = { path: p, uidValidity: 7n, highestModseq: BigInt(folders[p]!.modseq ?? 0) };
+      }
       let done = false;
       return { release: () => { if (!done) { done = true; release(); } } };
     },
@@ -133,4 +137,30 @@ it("keeps searching every folder on a server without CONDSTORE", async () => {
   searched.length = 0;
   expect((await labelQuery(ctx, trashId)).total).toBe(2);
   expect(searched.sort()).toEqual(["Archive", "INBOX"]);
+});
+
+it("doesn't file an older cached search under a newer modseq", async () => {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  const account = store.upsertAccount({ slug: "c", kind: "generic", host: "h", username: "u", vault: Buffer.from("v") });
+  const folders: Record<string, Folder> = {
+    INBOX: { uids: [1, 2], labelled: [1], modseq: 10 },
+    Trash: { uids: [], labelled: [], modseq: 50 },
+  };
+  const { client } = fakeServer(folders);
+  const ctx = { account, client, store };
+  const trashId = (await listMailboxes(client, account, store)).find((m) => m.role === "trash")!.id;
+  expect((await labelQuery(ctx, trashId)).total).toBe(1);
+
+  // Another device labels message 2. The connection that has INBOX open
+  // still reports modseq 10; a Mailbox state move refreshes the LIST, which
+  // reports 11. The old search, served from the search cache, must not be
+  // remembered as the result for 11.
+  folders.INBOX!.labelled = [1, 2];
+  folders.INBOX!.modseq = 11;
+  store.bumpState(account.id, "mailbox");
+  await labelQuery(ctx, trashId);
+
+  // Once the search cache has expired, a fresh search finds both.
+  vi.setSystemTime(Date.now() + 31_000);
+  expect((await labelQuery(ctx, trashId)).total).toBe(2);
 });
