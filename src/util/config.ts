@@ -42,6 +42,8 @@ export interface AppConfig {
   sessionHmacKey: Buffer;
   defaultProvider: string;
   providers: Record<string, ProviderConfig>;
+  /** How often open event streams get a CalDAV change check, in seconds; 0 = never. */
+  caldavPollSeconds: number;
   limits: {
     maxConcurrentRequests: number;
     maxObjectsInGet: number;
@@ -50,6 +52,15 @@ export interface AppConfig {
     maxSizeRequest: number;
     maxCallsInRequest: number;
   };
+}
+
+// Default two minutes: CalDAV has no push, so clients poll, and every check is
+// one PROPFIND per account. Below 30 s would only add load on the DAV server.
+function pollSeconds(v: string | undefined): number {
+  if (v === undefined || v === "") return 120;
+  const n = Number(v);
+  if (!Number.isFinite(n) || n < 0) throw new Error("CALDAV_POLL_SECONDS must be a number of seconds, 0 to turn it off");
+  return n === 0 ? 0 : Math.max(30, n);
 }
 
 function reqEnv(name: string): string {
@@ -84,6 +95,7 @@ export function loadConfig(): AppConfig {
     sessionHmacKey: b64Key("SESSION_HMAC_KEY", null),
     defaultProvider: process.env.DEFAULT_PROVIDER ?? "generic",
     providers,
+    caldavPollSeconds: pollSeconds(process.env.CALDAV_POLL_SECONDS),
     limits: {
       maxConcurrentRequests: Number(process.env.MAX_CONCURRENT_REQUESTS ?? 10),
       maxObjectsInGet: Number(process.env.MAX_OBJECTS_IN_GET ?? 500),

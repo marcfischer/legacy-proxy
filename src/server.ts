@@ -20,6 +20,8 @@ import { EventSourceHub } from "./jmap/eventsource.js";
 import { fetchAfterNoop, imapErrorDetails, openImap } from "./imap/client.js";
 import { PushDispatcher } from "./push/dispatcher.js";
 import { PushIdleManager } from "./push/idle.js";
+import { CalendarWatcher } from "./push/calendar-watch.js";
+import { calendarEventState, calendarsAvailable } from "./jmap/methods/calendars.js";
 
 import { loadGmailConfig } from "./gmail/config.js";
 import { GmailStore } from "./gmail/store.js";
@@ -52,6 +54,23 @@ dispatcher.setHooks({ onSubscriberChange: idleManager.onSubscriberChange });
 void idleManager.sync().catch((err) =>
   log.warn({ err: (err as Error).message }, "idle: initial sync failed"),
 );
+
+// Calendar changes made elsewhere reach open event streams by polling; see
+// push/calendar-watch.ts. CALDAV_POLL_SECONDS sets the interval.
+const calendarWatcher = new CalendarWatcher({
+  intervalMs: cfg.caldavPollSeconds * 1000,
+  accounts: () => hub.accountIds(),
+  accountById: (id) => store.getAccountById(id),
+  stateOf: async (account) => {
+    const provider = resolveProvider(cfg, account.kind);
+    if (!calendarsAvailable(provider)) return null;
+    const creds = await openCredentials(cfg.vaultKey, account.vault);
+    return calendarEventState({ account, provider, creds });
+  },
+  publish: (account, state) =>
+    hub.publish(account, { "@type": "StateChange", changed: { [String(account.id)]: { CalendarEvent: state } } }),
+});
+calendarWatcher.start();
 
 const app = Fastify({
   loggerInstance: log,
@@ -497,6 +516,7 @@ const shutdown = async () => {
   log.info("shutting down");
   try {
     await app.close();
+    calendarWatcher.stop();
     await idleManager.closeAll();
     // Best-effort flush so the burst of changes a user just made still reaches
     // any connected SSE / push relay before we exit.
