@@ -64,6 +64,9 @@ JMAP method coverage:
 | PushSubscription  | `get`, `set` (verification handshake, relay forwarding, expiry caps) |
 | AddressBook       | `get`, `changes`, `set` (extended MKCOL / PROPPATCH / DELETE via CardDAV) |
 | ContactCard       | `get`, `query`, `queryChanges`, `changes`, `set` (PUT / DELETE via CardDAV) |
+| Calendar          | `get` (via CalDAV; calendars can't be created or renamed yet)         |
+| CalendarEvent     | `get`, `query` (`inCalendar(s)`, `after` / `before`, `uid`), `set` (PUT / DELETE via CalDAV), `parse` (uploads and mail parts) |
+| CalendarEventNotification | `query`, `get` (always empty: CalDAV has no notification inbox) |
 | Quota             | `get` (stub returning empty list, so probing clients don't error)    |
 
 Capabilities advertised on the Session resource:
@@ -73,6 +76,7 @@ Capabilities advertised on the Session resource:
 - `urn:ietf:params:jmap:submission`
 - `urn:ietf:params:jmap:vacationresponse`
 - `urn:ietf:params:jmap:contacts` (only when the active provider has CardDAV)
+- `urn:ietf:params:jmap:calendars` (only when the active provider has CalDAV)
 - `urn:bulwark:params:jmap:sieve` (vendor capability used by the vacation handler)
 
 Transport:
@@ -137,6 +141,15 @@ Backends:
   configured directly: set `host`, `port` and `secure` to the server the
   redirect leads to, and `basePath` to the DAV root there, or `principalPath`
   to the user's principal to skip discovery.
+- CalDAV (RFC 4791) for Calendar and CalendarEvent. Event lists are a
+  `calendar-query` with the JMAP `after` / `before` range passed through as a
+  `time-range`; bodies come from `calendar-multiget` and are projected to
+  JSCalendar. Recurring series are returned as rules plus overrides, not
+  expanded; tasks (VTODO) are skipped. Writes are `PUT` (`If-None-Match: *` /
+  `If-Match`) and `DELETE`; an update re-serialises the event but keeps its
+  VTIMEZONEs and any properties the projection doesn't model. Moving an event
+  to another calendar is rejected, and the server's own scheduling decides
+  whether attendees get invitations (`sendSchedulingMessages` is ignored).
 
 Auth and storage:
 
@@ -1002,6 +1015,7 @@ network and needs no published port at all. Publish it on all interfaces
 | `LOG_SUBMISSION_ADDRESSES` | unset                              | set to `1` to log sender and recipients of each send |
 | `PUSH_ALLOW_PRIVATE_URLS`  | unset                              | set to `1` to allow push URLs on private networks and plain `http` (IMAP backend) |
 | `TRUST_PROXY`              | unset                              | reverse proxy addresses or ranges; see below         |
+| `CALDAV_POLL_SECONDS`      | `120`                              | CalDAV change check for open event streams; `0` off  |
 
 The limits the Session resource advertises are the ones the proxy enforces:
 
@@ -1094,15 +1108,17 @@ entry. If you set `TRUST_PROXY=1` or `TRUST_PROXY=true` before, replace it with
 the reverse proxy's address or network when you upgrade.
 
 `providers.example.json` ships entries for Gmail and a generic
-`$IMAP_HOST` / `$SMTP_HOST` / `$SIEVE_HOST` / `$CARDDAV_HOST` template.
-A `null` for any of `sieve` or `carddav` is allowed; the corresponding JMAP
-methods will then either return empty results or, for vacation, reject with
-the underlying ManageSieve error. An optional `domains` array on a provider
-opts it into domain-based [provider selection](#provider-selection);
+`$IMAP_HOST` / `$SMTP_HOST` / `$SIEVE_HOST` / `$CARDDAV_HOST` / `$CALDAV_HOST`
+template. A `null` for any of `sieve`, `carddav` or `caldav` is allowed; the
+corresponding JMAP methods will then either return empty results or, for
+vacation, reject with the underlying ManageSieve error. An optional `domains`
+array on a provider opts it into domain-based
+[provider selection](#provider-selection);
 `providers.two-servers.example.json` shows two providers wired up that way.
 CardDAV logs in with the user's mail credentials. When the DAV server wants
 a different login (mailbox.org app passwords, for example, are scoped to one
-service), set `username`, `password` and `forUser` on the `carddav` entry:
+service), set `username`, `password` and `forUser` on the `carddav` / `caldav`
+entry:
 
 ```json
 "carddav": { "host": "dav.mailbox.org", "port": 443, "secure": true,
@@ -1113,6 +1129,9 @@ service), set `username`, `password` and `forUser` on the `carddav` entry:
 A provider's settings apply to everyone who logs in through it, so the DAV
 login is used only for the mail login named in `forUser`; everyone else keeps
 their own. Setting some of the three keys but not all is an error.
+
+An optional `caldav` entry (same shape as `carddav`, discovery default
+`/.well-known/caldav`) turns on calendars.
 
 ### Encryption to the mail server
 

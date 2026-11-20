@@ -3,7 +3,7 @@ import type { ImapFlow } from "imapflow";
 import type { AccountRow, Store } from "../../state/store.js";
 import type { AppConfig } from "../../util/config.js";
 import { decodeEmailId } from "../../mapping/ids.js";
-import { withMailbox } from "../../imap/client.js";
+import { fetchAfterNoop, withMailbox } from "../../imap/client.js";
 import { resolveProvider } from "../../auth/providers.js";
 import { openAccountCredentials } from "../../auth/credentials.js";
 import { submit } from "../../smtp/submit.js";
@@ -107,11 +107,12 @@ async function fetchRfc822(
     .get(parts.mailboxIdx, accountId) as { name: string } | undefined;
   if (!mbox) throw notFound();
 
-  const raw = await withMailbox(client, mbox.name, async () => {
-    const msg = await client.fetchOne(`${parts.uid}`, { uid: true, source: true }, { uid: true });
-    if (!msg || !msg.source) return null;
-    return msg.source;
-  });
+  const raw = await withMailbox(client, mbox.name, () =>
+    fetchAfterNoop(client, { mailbox: mbox.name, uid: parts.uid }, async () => {
+      const msg = await client.fetchOne(`${parts.uid}`, { uid: true, source: true }, { uid: true });
+      return msg && msg.source ? msg.source : null;
+    }),
+  );
   if (!raw) throw notFound();
   return { raw, mailboxName: mbox.name };
 }
@@ -371,6 +372,10 @@ export async function emailSubmissionSet(
       implicitDestroyed.push(ok.emailId);
     } catch (e) {
       implicitNotDestroyed[ok.emailId] = toSetErrorLike(e);
+      log.warn(
+        { emailId: ok.emailId, err: (e as Error).message },
+        "submission: sent, but destroying the draft failed",
+      );
     }
   }
   for (const [refKey, patch] of Object.entries(args.onSuccessUpdateEmail ?? {})) {
@@ -394,6 +399,12 @@ export async function emailSubmissionSet(
       implicitUpdated[ok.emailId] = null;
     } catch (e) {
       implicitNotUpdated[ok.emailId] = toSetErrorLike(e);
+      // The mail is out but still sits among the drafts; sending it from
+      // there again would deliver it twice.
+      log.warn(
+        { emailId: ok.emailId, err: (e as Error).message },
+        "submission: sent, but updating the draft failed",
+      );
     }
   }
 

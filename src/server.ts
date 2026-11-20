@@ -11,7 +11,7 @@ import { Store } from "./state/store.js";
 import { ImapPool } from "./imap/pool.js";
 import { emailDomain, resolveLoginProvider, resolveProvider, type LoginProvider } from "./auth/providers.js";
 import { ProviderDiscovery, storedDiscoveredProvider } from "./auth/discovery.js";
-import { sealCredentials, openCredentials, sealPlace, type Credentials } from "./auth/credentials.js";
+import { sealCredentials, openCredentials, openAccountCredentials, sealPlace, type Credentials } from "./auth/credentials.js";
 import {
   credentialTag,
   generationValid,
@@ -27,12 +27,14 @@ import { KNOWN_CAPABILITIES } from "./jmap/capabilities.js";
 import { dispatch, isRequestEnvelope, NOT_REQUEST_PROBLEM } from "./jmap/router.js";
 import { makeLegacyMethods } from "./backends/legacy.js";
 import { EventSourceHub, type StreamSession } from "./jmap/eventsource.js";
-import { imapErrorDetails, isCredentialRefusal, openImap } from "./imap/client.js";
+import { fetchAfterNoop, imapErrorDetails, isCredentialRefusal, openImap } from "./imap/client.js";
 import { LoginLimiter } from "./auth/loginLimit.js";
 import { StoredPasswordChecks, type CheckAttemptResult } from "./auth/storedCheck.js";
 import { BasicLoginCache } from "./auth/basicCache.js";
 import { PushDispatcher } from "./push/dispatcher.js";
 import { PushIdleManager } from "./push/idle.js";
+import { CalendarWatcher } from "./push/calendar-watch.js";
+import { calendarEventState, calendarsAvailable } from "./jmap/methods/calendars.js";
 
 import { loadGmailConfig } from "./gmail/config.js";
 import { GmailStore } from "./gmail/store.js";
@@ -107,6 +109,23 @@ store.setCredentialListener((accountId) => {
 void idleManager.sync().catch((err) =>
   log.warn({ err: (err as Error).message }, "idle: initial sync failed"),
 );
+
+// Calendar changes made elsewhere reach open event streams by polling; see
+// push/calendar-watch.ts. CALDAV_POLL_SECONDS sets the interval.
+const calendarWatcher = new CalendarWatcher({
+  intervalMs: cfg.caldavPollSeconds * 1000,
+  accounts: () => hub.accountIds(),
+  accountById: (id) => store.getAccountById(id),
+  stateOf: async (account) => {
+    const provider = resolveProvider(cfg, account.kind);
+    if (!calendarsAvailable(provider)) return null;
+    const creds = await openAccountCredentials(cfg.vaultKey, account);
+    return calendarEventState({ account, provider, creds });
+  },
+  publish: (account, state) =>
+    hub.publish(account, { "@type": "StateChange", changed: { [String(account.id)]: { CalendarEvent: state } } }),
+});
+calendarWatcher.start();
 
 const app = Fastify({
   loggerInstance: log,
@@ -709,14 +728,13 @@ app.get<{ Params: { accountId: string; blobId: string; type: string; name: strin
     };
 
     try {
-      const dl = await client.download(
-        `${emailParts.uid}`,
-        parsed.partId ?? undefined,
-        { uid: true },
-      );
       // imapflow answers `{}` rather than null when the FETCH came back
       // without the message or part (expunged, or the server could not
       // produce it), so check for the stream itself.
+      const dl = await fetchAfterNoop(client, { mailbox: mbox.name, uid: emailParts.uid }, async () => {
+        const d = await client.download(`${emailParts.uid}`, parsed.partId ?? undefined, { uid: true });
+        return d?.content ? d : null;
+      });
       if (!dl?.content) {
         release();
         log.warn(
@@ -1063,6 +1081,7 @@ const shutdown = async () => {
   log.info("shutting down");
   try {
     await app.close();
+    calendarWatcher.stop();
     await idleManager.closeAll();
     // Best-effort flush so the burst of changes a user just made still reaches
     // any connected SSE / push relay before we exit.
