@@ -27,6 +27,7 @@ import { KNOWN_CAPABILITIES } from "./jmap/capabilities.js";
 import { dispatch, isRequestEnvelope, NOT_REQUEST_PROBLEM } from "./jmap/router.js";
 import { makeLegacyMethods } from "./backends/legacy.js";
 import { EventSourceHub, type StreamSession } from "./jmap/eventsource.js";
+import { BUSY_RETRY_AFTER_SEC, isTemporaryLoginRefusal, MailServerBusy } from "./imap/busy.js";
 import { imapErrorDetails, isCredentialRefusal, openImap } from "./imap/client.js";
 import { LoginLimiter } from "./auth/loginLimit.js";
 import { StoredPasswordChecks, type CheckAttemptResult } from "./auth/storedCheck.js";
@@ -176,6 +177,8 @@ function sendLimited(
     .send({ error: gate.error ?? (gate.status === 429 ? "too many failed logins" : "too many logins in progress") });
 }
 
+const MAIL_SERVER_BUSY = "the mail server accepts no further logins right now";
+
 // Login names and secrets longer than this are not credentials anyone uses.
 const MAX_USERNAME_LENGTH = 512;
 const MAX_SECRET_LENGTH = 16_384;
@@ -292,6 +295,9 @@ app.post("/api/login", async (req, reply) => {
   } catch (e) {
     gate.finish(isCredentialRefusal(e) ? "refused" : "error");
     log.warn({ ...imapErrorDetails(e), provider: providerName }, "login IMAP probe failed");
+    if (isTemporaryLoginRefusal(e)) {
+      return sendLimited(reply, { status: 503, retryAfterSec: BUSY_RETRY_AFTER_SEC, error: MAIL_SERVER_BUSY });
+    }
     // The mail server's answer stays in the log: a caller without a session learns only that it failed.
     return reply.code(401).send({ error: "auth failed" });
   }
@@ -718,7 +724,13 @@ app.get<{ Params: { accountId: string; blobId: string; type: string; name: strin
     // Both the pooled connection and the mailbox lock therefore outlive this
     // handler: they are given back when the body stream ends, not when the
     // route returns.
-    const lease = await pool.acquire(account, "bulk");
+    let lease;
+    try {
+      lease = await pool.acquire(account, "bulk");
+    } catch (e) {
+      if (!(e instanceof MailServerBusy)) throw e;
+      return sendLimited(reply, { status: 503, retryAfterSec: BUSY_RETRY_AFTER_SEC, error: e.message });
+    }
     const client = lease.client;
     const lock = await client.getMailboxLock(mbox.name);
     let released = false;
@@ -1047,7 +1059,9 @@ async function basicLogin(
     gate.finish(refused ? "refused" : "error");
     // Credentials the server refused are no longer ones the proxy knows.
     if (refused) basicCache.delete(tag);
-    log.warn({ err: (e as Error).message, provider: providerName, username }, "basic-auth IMAP probe failed");
+    log.warn({ ...imapErrorDetails(e), provider: providerName, username }, "basic-auth IMAP probe failed");
+    // The password may well be right: a 401 would sign the client out.
+    if (isTemporaryLoginRefusal(e)) return { ok: false, status: 503, retryAfterSec: BUSY_RETRY_AFTER_SEC, error: MAIL_SERVER_BUSY };
     return UNAUTHORIZED;
   }
   gate.finish("accepted");

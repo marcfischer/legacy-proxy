@@ -14,6 +14,7 @@ import type { ImapPool } from "../../imap/pool.js";
 import { decodeEmailId, decodeMailboxId, encodeEmailId } from "../../mapping/ids.js";
 import { decodeEmailState, encodeEmailState } from "../../state/states.js";
 import { accountNotFound, cannotCalculateChanges } from "../errors.js";
+import { MailServerBusy } from "../../imap/busy.js";
 import { withMailbox } from "../../imap/client.js";
 import { fetchByUid } from "../../imap/uids.js";
 import { listMailboxes, liveMailboxStatus, type LiveMailboxStatus } from "./mailbox.js";
@@ -217,7 +218,13 @@ async function rebuildThreadIndex(
   // Long scans ride the bulk connection so they don't queue behind (or hold
   // up) interactive method calls sharing the request-path connection. The
   // lease is held for the whole scan and returned however this exits.
-  const lease = ctx.pool ? await ctx.pool.acquire(ctx.account, "bulk") : null;
+  // Without a bulk connection to be had, the scan runs on the request's own.
+  const lease = ctx.pool
+    ? await ctx.pool.acquire(ctx.account, "bulk").catch((e) => {
+        if (e instanceof MailServerBusy) return null;
+        throw e;
+      })
+    : null;
   const client = lease ? lease.client : ctx.client;
   try {
 

@@ -4,7 +4,8 @@ import type { ImapPool } from "../../imap/pool.js";
 import { decodeEmailId, decodeMailboxId, encodeBlobId, encodeEmailId, encodeMailboxId } from "../../mapping/ids.js";
 import { encodeEmailState } from "../../state/states.js";
 import { dateMs, fetchEmailsBatch, isoDate, type JmapEmail } from "../../imap/fetcher.js";
-import { withMailbox } from "../../imap/client.js";
+import { isCommandRefusal, MailServerBusy } from "../../imap/busy.js";
+import { imapErrorDetails, withMailbox } from "../../imap/client.js";
 import { fetchByUid } from "../../imap/uids.js";
 import { JmapError, accountNotFound, invalidArguments, notFound, unsupportedFilter, unsupportedSort } from "../errors.js";
 import { compileFilter, UnsupportedFilter, type Filter } from "../../imap/search.js";
@@ -823,28 +824,44 @@ async function emailQueryAccountWideFull(
     return found;
   };
 
+  // A folder the scan could not reach would be missing from the result without
+  // the client knowing, so the query fails instead. The folders still running
+  // finish first: they may be using this request's connection.
+  let failure: { error: unknown } | null = null;
   const perFolder = await mapWithConcurrency(targets, ACCOUNT_SCAN_CONCURRENCY, async (t) => {
+    if (failure) return [] as SortableHit[];
     const cached = fromCache(t.idx, t.row);
     if (cached) return cached;
     try {
       // Unit-test contexts are built without a pool; fall back to the
       // request's own connection, which reproduces the old serial walk.
       if (!ctx.pool) return await scanFolder(t.idx, t.row, ctx.client);
-      return await ctx.pool.withConnection(ctx.account, "bulk", (client) =>
-        scanFolder(t.idx, t.row, client),
-      );
+      try {
+        return await ctx.pool.withConnection(ctx.account, "bulk", (client) =>
+          scanFolder(t.idx, t.row, client),
+        );
+      } catch (e) {
+        // No bulk connection to be had: walk the folders on this request's own.
+        if (!(e instanceof MailServerBusy)) throw e;
+        return await scanFolder(t.idx, t.row, ctx.client);
+      }
     } catch (e) {
+      if (!isCommandRefusal(e)) {
+        failure ??= { error: e };
+        return [] as SortableHit[];
+      }
       // A folder can disappear between LIST and SELECT (concurrent mutation),
       // and the DB may carry rows for folders the server no longer reports.
       // Skip rather than fail the whole query - pinned-mailbox queries still
       // surface mailbox errors loudly.
       log.warn(
-        { mailbox: t.row.name, err: (e as Error).message },
+        { mailbox: t.row.name, ...imapErrorDetails(e) },
         "account-wide Email/query: skipping mailbox",
       );
       return [] as SortableHit[];
     }
   });
+  if (failure) throw (failure as { error: unknown }).error;
   const hits: SortableHit[] = perFolder.flat();
 
   const effectiveSort: SortSpec[] = sort.length
