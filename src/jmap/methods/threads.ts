@@ -14,7 +14,7 @@ import type { ImapPool } from "../../imap/pool.js";
 import { decodeEmailId, decodeMailboxId, encodeEmailId } from "../../mapping/ids.js";
 import { decodeEmailState, encodeEmailState } from "../../state/states.js";
 import { accountNotFound, cannotCalculateChanges } from "../errors.js";
-import { MailServerBusy } from "../../imap/busy.js";
+import { MailServerBusy, searchedUids } from "../../imap/busy.js";
 import { withMailbox } from "../../imap/client.js";
 import { fetchByUid } from "../../imap/uids.js";
 import { listMailboxes, liveMailboxStatus, type LiveMailboxStatus } from "./mailbox.js";
@@ -133,7 +133,7 @@ async function syncMailboxScan(
   const cachedUids = store.getEmailCacheUids(account.id, mailboxId);
   if (cachedUids.length !== exists) {
     const searchResult = exists > 0 ? await client.search({ all: true }, { uid: true }) : [];
-    const live = new Set(Array.isArray(searchResult) ? (searchResult as number[]) : []);
+    const live = new Set(searchedUids(client, searchResult));
     const stale = cachedUids.filter((uid) => !live.has(uid));
     store.deleteEmailCacheUids(account.id, mailboxId, stale);
     const cachedSet = new Set(cachedUids);

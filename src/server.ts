@@ -24,7 +24,8 @@ import {
 import { blobCacheLimits, configureBlobCache } from "./jmap/blobs.js";
 import { buildSession } from "./jmap/session.js";
 import { KNOWN_CAPABILITIES } from "./jmap/capabilities.js";
-import { dispatch, isRequestEnvelope, NOT_REQUEST_PROBLEM } from "./jmap/router.js";
+import { runAbortable } from "./jmap/abort.js";
+import { dispatch, isReadOnlyRequest, isRequestEnvelope, NOT_REQUEST_PROBLEM } from "./jmap/router.js";
 import { makeLegacyMethods } from "./backends/legacy.js";
 import { EventSourceHub, type StreamSession } from "./jmap/eventsource.js";
 import { BUSY_RETRY_AFTER_SEC, isTemporaryLoginRefusal, MailServerBusy } from "./imap/busy.js";
@@ -620,14 +621,21 @@ app.post("/jmap", async (req, reply) => {
     });
   }
   jmapRequestsInFlight.set(account.id, running + 1);
+  // Only a request that changes nothing is given up with its client.
+  const gone = new AbortController();
+  if (isReadOnlyRequest(env)) {
+    reply.raw.once("close", () => {
+      if (!reply.raw.writableFinished) gone.abort();
+    });
+  }
   try {
-    const out = await dispatch(env, {
+    const out = await runAbortable(gone.signal, () => dispatch(env, {
       methods: makeLegacyMethods({ cfg, pool, store, account, dispatcher }),
       maxCallsInRequest: cfg.limits.maxCallsInRequest,
       maxObjectsInGet: cfg.limits.maxObjectsInGet,
       maxObjectsInSet: cfg.limits.maxObjectsInSet,
       sessionState: `s${account.id}`,
-    });
+    }));
     if (process.env.JMAP_DEBUG === "1") {
       log.info(
         { calls: env.methodCalls.map((c) => c[0]), responses: out.methodResponses },

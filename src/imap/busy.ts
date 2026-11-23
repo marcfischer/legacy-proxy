@@ -32,6 +32,20 @@ export class MailServerBusy extends JmapError {
 }
 
 /**
+ * The UIDs a UID SEARCH found. imapflow answers `false` when the command
+ * failed, which must not pass for a folder without matches.
+ */
+export function searchedUids(client: { usable?: boolean }, result: unknown): number[] {
+  if (Array.isArray(result)) return result as number[];
+  // The server's NO text is in imapflow's own warning. On a connection that
+  // still works it was the server refusing the command.
+  throw Object.assign(
+    new JmapError("serverFail", "the mail server could not search the mailbox"),
+    client.usable === false ? {} : { responseStatus: "NO" },
+  );
+}
+
+/**
  * True when the server answered a command on a working connection with NO or
  * BAD: the mailbox is the problem, not the connection.
  */

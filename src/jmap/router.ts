@@ -1,6 +1,7 @@
 import { log } from "../util/log.js";
 import { JmapError, invalidArguments, unknownMethod } from "./errors.js";
 import { harvestCreatedIds, resolveArgs, type CreatedIds } from "./refs.js";
+import { throwIfClientGone } from "./abort.js";
 import { imapErrorDetails } from "../imap/client.js";
 import { describeArgs, describeTrace, newTrace, runTraced } from "./trace.js";
 
@@ -244,6 +245,7 @@ async function runCall(
       throw unknownMethod(name);
     }
     checkObjectLimits(name, args, ctx);
+    throwIfClientGone();
     const result = await runTraced(trace, () => handler(args));
     const ms = Date.now() - t0;
     // What was asked and where the time went, so a slow call names its cause.
@@ -275,6 +277,11 @@ async function runCall(
         : { type: "serverFail", description: (e as Error).message };
     return { name: "error", result, sideResponses: null };
   }
+}
+
+/** True when nothing in the request changes anything, so it may stop half-way. */
+export function isReadOnlyRequest(env: RequestEnvelope): boolean {
+  return env.methodCalls.every(([name]) => PARALLEL_SAFE_METHODS.has(name));
 }
 
 export async function dispatch(env: RequestEnvelope, ctx: DispatchContext): Promise<ResponseEnvelope> {
