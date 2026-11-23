@@ -1,6 +1,7 @@
 import { log } from "../util/log.js";
 import { JmapError, invalidArguments, unknownMethod } from "./errors.js";
 import { harvestCreatedIds, resolveArgs, type CreatedIds } from "./refs.js";
+import { imapErrorDetails } from "../imap/client.js";
 import { describeArgs, describeTrace, newTrace, runTraced } from "./trace.js";
 
 export type MethodCall = [string, Record<string, unknown>, string];
@@ -265,7 +266,7 @@ async function runCall(
   } catch (e) {
     const ms = Date.now() - t0;
     log.warn(
-      { method: name, callId, ms, err: (e as Error).message, args: shape, upstream: describeTrace(trace) },
+      { method: name, callId, ms, ...imapErrorDetails(e), args: shape, upstream: describeTrace(trace) },
       "jmap method error",
     );
     const result =

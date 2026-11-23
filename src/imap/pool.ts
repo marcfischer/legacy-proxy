@@ -3,6 +3,7 @@ import type { Credentials } from "../auth/credentials.js";
 import type { AppConfig } from "../util/config.js";
 import { resolveProvider } from "../auth/providers.js";
 import { openAccountCredentials } from "../auth/credentials.js";
+import { isTemporaryLoginRefusal, MailServerBusy } from "./busy.js";
 import { isCredentialRefusal, openImap } from "./client.js";
 import { nextStoredAttemptAt, type Store, type AccountRow } from "../state/store.js";
 import { log } from "../util/log.js";
@@ -45,6 +46,12 @@ const NOOP_FRESHNESS_MS = 30_000;
 const IDLE_MAX_MS = 5 * 60_000;
 const REAP_INTERVAL_MS = 60_000;
 
+// After the server turned a login away for now (a connection limit, most
+// often), no further dial for the account until this long has passed; doubled
+// with every such answer in a row.
+const DIAL_PAUSE_MIN_MS = 5_000;
+const DIAL_PAUSE_MAX_MS = 60_000;
+
 // Two connection roles per account:
 //   - "interactive": JMAP method calls (the latency-sensitive path).
 //   - "bulk": blob downloads and thread-index scans — operations that can
@@ -80,6 +87,8 @@ export class ImapPool {
   // and the chain of dials for those that have not (see takeFree).
   private verified = new Set<number>();
   private dialLocks = new Map<number, Promise<void>>();
+  // Accounts whose last dial the server turned away for now.
+  private dialPauses = new Map<number, { until: number; ms: number }>();
   private reaper: NodeJS.Timeout;
 
   constructor(
@@ -117,25 +126,33 @@ export class ImapPool {
     const key = `${account.id}:${role}`;
     const requestedAt = Date.now();
     for (;;) {
-      const entry = await this.takeFree(account, key, role, requestedAt);
-      if (entry) return this.leaseFor(key, entry);
+      let taken: { entry: PoolEntry } | { parked: Promise<void> };
+      try {
+        taken = await this.takeFree(account, key, role, requestedAt);
+      } catch (e) {
+        if (!(e instanceof MailServerBusy) || !this.hasConnections(key)) throw e;
+        // The role has connections, only no further one: share those.
+        continue;
+      }
+      if ("entry" in taken) return this.leaseFor(key, taken.entry);
       // At the cap with everything busy: park until someone releases, then
       // re-run the whole selection (the freed entry may have died meanwhile).
-      await this.waitForRelease(key);
+      await taken.parked;
     }
   }
 
   /**
    * Claim a usable idle connection, or open one if the role is under its cap.
-   * Returns null when every slot is taken. `requestedAt` is when the request
-   * asked for the connection (see nextStoredAttemptAt).
+   * When every slot is taken the caller is parked, in the same step as the
+   * check so that no release slips in between. `requestedAt` is when the
+   * request asked for the connection (see nextStoredAttemptAt).
    */
   private async takeFree(
     account: AccountRow,
     key: string,
     role: PoolRole,
     requestedAt: number,
-  ): Promise<PoolEntry | null> {
+  ): Promise<{ entry: PoolEntry } | { parked: Promise<void> }> {
     const list = [...(this.entries.get(key) ?? [])];
     for (const entry of list) {
       if (entry.busy) continue;
@@ -147,11 +164,11 @@ export class ImapPool {
       const idleMs = Date.now() - entry.lastUsed;
       entry.lastUsed = Date.now();
       const emailState = this.store.getState(account.id, "email");
-      if (idleMs < NOOP_FRESHNESS_MS && entry.emailState === emailState) return entry;
+      if (idleMs < NOOP_FRESHNESS_MS && entry.emailState === emailState) return { entry };
       try {
         await entry.client.noop();
         entry.emailState = emailState;
-        return entry;
+        return { entry };
       } catch {
         // Dead despite looking usable; drop it and keep looking.
         entry.busy = false;
@@ -161,7 +178,15 @@ export class ImapPool {
 
     // Connections still being opened count against the cap too.
     const opening = this.opening.get(key) ?? 0;
-    if ((this.entries.get(key)?.length ?? 0) + opening >= MAX_PER_ROLE[role]) return null;
+    if ((this.entries.get(key)?.length ?? 0) + opening >= MAX_PER_ROLE[role]) {
+      return { parked: this.waitForRelease(key) };
+    }
+    if (this.dialsPaused(account.id)) {
+      if (this.hasConnections(key)) return { parked: this.waitForRelease(key) };
+      // Nobody is left to release a connection: the others parked here learn it too.
+      this.wake(key);
+      throw new MailServerBusy();
+    }
     this.opening.set(key, opening + 1);
     let unlock: (() => void) | null = null;
     let opened = false;
@@ -171,6 +196,8 @@ export class ImapPool {
       // each one sees the refusals of the one before, so requests that arrive
       // together cannot send more logins than the refused mark allows.
       if (!this.verified.has(account.id)) unlock = await this.lockDials(account.id);
+      // The dial this one waited for may have been turned away.
+      if (this.dialsPaused(account.id)) throw new MailServerBusy();
 
       // Dial with the credentials the row holds now, not the ones the request
       // started with, and not at all once the mail server refused them: the
@@ -192,15 +219,20 @@ export class ImapPool {
           this.verified.delete(account.id);
           this.store.noteCredentialRefusal(current.id, current.cred_gen);
         }
+        if (isTemporaryLoginRefusal(e)) {
+          this.pauseDials(account, e);
+          throw new MailServerBusy();
+        }
         throw e;
       }
+      this.dialPauses.delete(account.id);
       if (current.cred_refusals > 0) this.store.noteCredentialSuccess(current.id);
       this.verified.add(account.id);
       const emailState = this.store.getState(account.id, "email");
       const entry: PoolEntry = { client, lastUsed: Date.now(), busy: true, emailState };
       this.attach(account, key, entry);
       opened = true;
-      return entry;
+      return { entry };
     } finally {
       unlock?.();
       const left = (this.opening.get(key) ?? 1) - 1;
@@ -209,6 +241,28 @@ export class ImapPool {
       // A slot reserved for a dial that failed is free again.
       if (!opened) this.wake(key);
     }
+  }
+
+  /** True when the role has connections, open or being opened, that will be given back. */
+  private hasConnections(key: string): boolean {
+    return (this.entries.get(key)?.length ?? 0) + (this.opening.get(key) ?? 0) > 0;
+  }
+
+  private dialsPaused(accountId: number): boolean {
+    return Date.now() < (this.dialPauses.get(accountId)?.until ?? 0);
+  }
+
+  private pauseDials(account: AccountRow, e: unknown): void {
+    const before = this.dialPauses.get(account.id);
+    // Dials that were under way together count as one answer.
+    if (before && Date.now() < before.until) return;
+    const ms = Math.min(before ? before.ms * 2 : DIAL_PAUSE_MIN_MS, DIAL_PAUSE_MAX_MS);
+    this.dialPauses.set(account.id, { until: Date.now() + ms, ms });
+    const err = e as { responseText?: string; serverResponseCode?: string };
+    log.warn(
+      { account: account.slug, pauseMs: ms, responseText: err.responseText, serverResponseCode: err.serverResponseCode },
+      "imap login turned away for now; pausing new connections",
+    );
   }
 
   /** Wait for the account's previous dial to finish; returns the release for this one. */

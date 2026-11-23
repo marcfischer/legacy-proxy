@@ -4,6 +4,7 @@ import { connectHost } from "../auth/discovery.js";
 import { assertTransport, loginName, transportOf } from "../auth/providers.js";
 import type { ProviderConfig } from "../util/config.js";
 import { log } from "../util/log.js";
+import { isTemporaryLoginRefusal } from "./busy.js";
 
 export interface ImapConnOpts {
   provider: ProviderConfig;
@@ -73,21 +74,13 @@ export async function withMailbox<T>(
   }
 }
 
-// Response codes (RFC 5530) a server gives to a login it cannot serve right
-// now. imapflow flags every NO to LOGIN/AUTHENTICATE as an authentication
-// failure; these mean "try again later", not "wrong credentials". Stalwart
-// answers a store error during the login with CONTACTADMIN.
-const TEMPORARY_LOGIN_CODES = new Set(["UNAVAILABLE", "SERVERBUG", "INUSE", "LIMIT", "CONTACTADMIN"]);
-
 /**
  * True when the mail server refused the credentials themselves, as opposed to
  * a connection that failed or a server that asks to try again later.
  */
 export function isCredentialRefusal(e: unknown): boolean {
-  const err = e as { authenticationFailed?: unknown; serverResponseCode?: unknown } | null;
-  if (!err || err.authenticationFailed !== true) return false;
-  const code = typeof err.serverResponseCode === "string" ? err.serverResponseCode.toUpperCase() : "";
-  return !TEMPORARY_LOGIN_CODES.has(code);
+  const err = e as { authenticationFailed?: unknown } | null;
+  return err?.authenticationFailed === true && !isTemporaryLoginRefusal(e);
 }
 
 // A pooled connection that already has the mailbox selected hears about
