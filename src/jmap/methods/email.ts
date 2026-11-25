@@ -11,6 +11,7 @@ import { imapErrorDetails, withMailbox } from "../../imap/client.js";
 import { fetchByUid } from "../../imap/uids.js";
 import { JmapError, accountNotFound, invalidArguments, notFound, unsupportedFilter, unsupportedSort } from "../errors.js";
 import { compileFilter, UnsupportedFilter, type Filter } from "../../imap/search.js";
+import { searchesText, searchText, type TextSearch } from "../../imap/textsearch.js";
 import { listMailboxes, liveMailboxStatus, refreshMailboxCounts, type LiveMailboxStatus } from "./mailbox.js";
 import { log } from "../../util/log.js";
 import { mapWithConcurrency } from "../../util/concurrency.js";
@@ -172,8 +173,8 @@ async function cachedSearch(
   cacheKey: string,
   imapFilter: ReturnType<typeof compileFilter>,
   wasOpen: boolean,
-  /** When a full-text search has to be done by; null for any other. */
-  textUntil: number | null,
+  /** A full-text search; null for any other. */
+  text: TextSearch | null,
   onSearched?: (uids: number[]) => void,
 ): Promise<number[]> {
   const emailState = store.getState(accountId, "email");
@@ -181,23 +182,21 @@ async function cachedSearch(
   if (cached && cached.modseq === openModseq(client) && cached.emailState === emailState && cached.expiresAt > Date.now()) {
     return cached.uids;
   }
-  const open = typeof client.mailbox === "object" && client.mailbox ? client.mailbox : null;
-  const t0 = Date.now();
+  const folder = typeof client.mailbox === "object" && client.mailbox ? client.mailbox.path : "";
+  if (wasOpen) await withDeadline(client, searchTimeoutMs(), "NOOP", () => client.noop());
   // A full-text search is long enough to be worth a connection to stop.
-  const searchResult = await withDeadline(
-    client,
-    textUntil === null ? searchTimeoutMs() : Math.max(1, textUntil - t0),
-    `SEARCH ${open?.path ?? ""} (${open?.exists ?? "?"} messages)`,
-    async () => {
-      if (wasOpen) await client.noop();
-      return await client.search(imapFilter, { uid: true });
-    },
-    textUntil === null ? undefined : clientSignal(),
-  );
-  if (textUntil !== null && Date.now() - t0 >= 1_000) {
-    log.info({ mailbox: open?.path, messages: open?.exists, ms: Date.now() - t0 }, "slow text search in folder");
-  }
-  const uids = searchedUids(client, searchResult);
+  const uids =
+    (text && (await searchText(client, text))) ??
+    searchedUids(
+      client,
+      await withDeadline(
+        client,
+        text ? Math.max(1, text.until - Date.now()) : searchTimeoutMs(),
+        `SEARCH in ${folder}`,
+        () => client.search(imapFilter, { uid: true }),
+        text?.signal,
+      ),
+    );
   onSearched?.(uids);
   searchCache.set(cacheKey, {
     uids,
@@ -646,6 +645,40 @@ function bodyStructureHasAttachment(bs: unknown): boolean {
   return false;
 }
 
+/** What a full-text search of the folder needs; null for any other search, and for Gmail's index. */
+function textSearch(
+  ctx: MailCtx,
+  filter: Filter,
+  mailboxIdx: number,
+  uidvalidity: number,
+  until: number | null,
+): TextSearch | null {
+  if (until === null || ctx.account.kind === "gmail") return null;
+  const want = findHasAttachment(filter);
+  return {
+    filter,
+    until,
+    folderKey: `${ctx.account.id}|${mailboxIdx}|${uidvalidity}`,
+    signal: clientSignal(),
+    // IMAP has no criterion for attachments, but the cache knows most messages.
+    narrow:
+      want === null
+        ? undefined
+        : (uids) => {
+            const rows = ctx.store.getEmailCacheRows(ctx.account.id, mailboxIdx, uidvalidity, uids);
+            return uids.filter((uid) => {
+              const bs = rows.get(uid)?.bodystructure;
+              if (bs == null || bs === "null") return true;
+              try {
+                return bodyStructureHasAttachment(JSON.parse(bs)) === want;
+              } catch {
+                return true;
+              }
+            });
+          },
+  };
+}
+
 async function emailQuerySingleMailboxFull(
   ctx: MailCtx,
   filter: Filter,
@@ -670,7 +703,7 @@ async function emailQuerySingleMailboxFull(
     );
 
     const cacheKey = searchCacheKey(ctx.account.id, m.mailboxIdx, uidvalidity, filter);
-    const uids = await cachedSearch(ctx.client, ctx.store, ctx.account.id, cacheKey, imapFilter, wasOpen, textUntil);
+    const uids = await cachedSearch(ctx.client, ctx.store, ctx.account.id, cacheKey, imapFilter, wasOpen, textSearch(ctx, filter, m.mailboxIdx, uidvalidity, textUntil));
     let orderedUids: number[];
     // Fast path: a pure receivedAt sort (or no sort) is UID order in a single
     // mailbox — SEARCH already returned UIDs ascending, so no FETCH at all.
@@ -731,25 +764,22 @@ const ACCOUNT_SCAN_CONCURRENCY = 3;
 // takes tens of seconds over a large account. Those scans go one folder at a
 // time per account, so the second bulk connection stays free for the thread
 // index and downloads that opening a folder waits for.
-const textScans = new Map<number, Promise<unknown>>();
+//
+// The newest goes first: a webmail searches while a filter is still being
+// typed, and what the user waits for is the last of those searches.
+const textScans = new Map<number, Array<() => void>>();
 
 async function oneTextScan<T>(accountId: number, scan: () => Promise<T>): Promise<T> {
-  const before = textScans.get(accountId) ?? Promise.resolve();
-  const mine = before.then(scan);
-  const tail = mine.catch(() => {});
-  textScans.set(accountId, tail);
+  const waiting = textScans.get(accountId);
+  if (waiting) await new Promise<void>((turn) => waiting.push(turn));
+  else textScans.set(accountId, []);
   try {
-    return await mine;
+    return await scan();
   } finally {
-    if (textScans.get(accountId) === tail) textScans.delete(accountId);
+    const next = textScans.get(accountId)!.pop();
+    if (next) next();
+    else textScans.delete(accountId);
   }
-}
-
-/** True when the filter needs the server to read message text. */
-function searchesText(filter: Filter): boolean {
-  if ("conditions" in filter) return (filter.conditions as Filter[]).some(searchesText);
-  const c = filter as { text?: unknown; body?: unknown };
-  return c.text !== undefined || c.body !== undefined;
 }
 
 async function emailQueryAccountWideFull(
@@ -841,7 +871,7 @@ async function emailQueryAccountWideFull(
       const cacheKey = searchCacheKey(ctx.account.id, idx, uidvalidity, filter);
       // Only a SEARCH that just ran vouches for the modseq read before it; a
       // searchCache hit may be older than that.
-      const uids = await cachedSearch(client, ctx.store, ctx.account.id, cacheKey, imapFilter, wasOpen, textUntil, (found) => {
+      const uids = await cachedSearch(client, ctx.store, ctx.account.id, cacheKey, imapFilter, wasOpen, textSearch(ctx, filter, idx, uidvalidity, textUntil), (found) => {
         if (liveBefore && liveBefore.uidValidity === uidvalidity) rememberFolderSearch(cacheKey, liveBefore, found);
       });
       if (uids.length === 0) return;

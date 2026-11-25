@@ -89,6 +89,14 @@ it("still scans folders side by side for a keyword", async () => {
   expect(pool.most).toBeGreaterThan(1);
 });
 
+it("serves the newest of the searches that wait", async () => {
+  const order: string[] = [];
+  const named = (n: string) => countingPool(async () => { order.push(n); await slow(); return [1]; });
+  const searches = ["first", "second", "third"].map((n) => query({ text: n }, makeClient(slow), named(n)));
+  await Promise.all(searches);
+  expect(order.indexOf("third")).toBeLessThan(order.indexOf("second"));
+});
+
 it("goes on with the next search after one failed", async () => {
   const bad = countingPool(async () => { throw Object.assign(new Error("gone"), { code: "NoConnection" }); });
   await expect(query({ text: "one" }, makeClient(slow), bad)).rejects.toThrow("gone");
