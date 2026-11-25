@@ -3,6 +3,7 @@
 
 import { afterAll, beforeEach, expect, it } from "vitest";
 import type { ImapFlow } from "imapflow";
+import { htmlToSearchText } from "../../src/mapping/htmlText.js";
 import { matchesText, resetTextSearch, searchText, splitTextFilter, TextSearchStalled, type MessageText } from "../../src/imap/textsearch.js";
 
 process.env.LOG_LEVEL = "silent";
@@ -142,4 +143,24 @@ it("stops asking for an account that left two folders unanswered, but not for an
   for (const folderKey of ["1|a", "1|b"]) await expect(run(silentServer(50), { text: "word" }, { read, folderKey })).rejects.toBeInstanceOf(TextSearchStalled);
   expect(await run(silentServer(50), { text: "word" }, { read, folderKey: "1|c" })).toHaveLength(5);
   await expect(run(silentServer(50), { text: "word" }, { read, folderKey: "2|a" })).rejects.toBeInstanceOf(TextSearchStalled);
+});
+
+it.each([
+  ["part of a word", "leistungsnachweis", "<p>Die Leistungsnachweisen</p>"],
+  ["a tag within a word", "leistungsnachweis", "<p>Leistungs<b>nachweis</b>en</p>"],
+  ["a soft hyphen", "leistungsnachweis", "Leistungs&shy;nachweisen"],
+  ["a zero-width space", "leistungsnachweis", "Leistungs\u200bnachweisen"],
+  ["a named entity", "müller größe", "M&uuml;ller, Gr&ouml;&szlig;e"],
+  ["numeric entities", "müller", "M&#252;ller"],
+  ["hex entities", "müller", "M&#xFC;ller"],
+  ["words in two cells", '"zwei worte"', "<td>zwei</td><td>worte</td>"],
+  ["a comparison", "a<b", "<p>a&lt;b</p>"],
+])("finds %s in an HTML part", (_name, text, html) => {
+  expect(matchesText([{ text }], { header: "", body: htmlToSearchText(html) })).toBe(true);
+});
+
+it("finds no words that only stand in styles, scripts, comments or attributes, or that blocks keep apart", () => {
+  const body = htmlToSearchText('<style>.hidden{}</style><script>var hidden</script><!-- hidden --><a title="hidden">x</a><p>hid</p><p>den</p>&bogus;');
+  expect(matchesText([{ text: "hidden" }], { header: "", body })).toBe(false);
+  expect(body).toContain("&bogus;");
 });

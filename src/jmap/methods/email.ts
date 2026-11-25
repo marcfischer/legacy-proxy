@@ -3,7 +3,7 @@ import type { AccountRow, Store, EmailCacheUpsert } from "../../state/store.js";
 import type { ImapPool } from "../../imap/pool.js";
 import { decodeEmailId, decodeMailboxId, encodeBlobId, encodeEmailId, encodeMailboxId } from "../../mapping/ids.js";
 import { encodeEmailState } from "../../state/states.js";
-import { dateMs, fetchEmailsBatch, htmlToPlain, isoDate, type JmapEmail } from "../../imap/fetcher.js";
+import { dateMs, fetchEmailsBatch, isoDate, type JmapEmail } from "../../imap/fetcher.js";
 import { gotNoConnection, isCommandRefusal, MailServerBusy, searchedUids } from "../../imap/busy.js";
 import { searchTimeoutMs, textSearchMs, withDeadline } from "../../imap/deadline.js";
 import { clientSignal, throwIfClientGone } from "../abort.js";
@@ -11,6 +11,7 @@ import { imapErrorDetails, withMailbox } from "../../imap/client.js";
 import { fetchByUid } from "../../imap/uids.js";
 import { JmapError, accountNotFound, invalidArguments, notFound, unsupportedFilter, unsupportedSort } from "../errors.js";
 import { compileFilter, UnsupportedFilter, type Filter } from "../../imap/search.js";
+import { htmlToSearchText } from "../../mapping/htmlText.js";
 import { searchesText, searchText, TextSearchStalled, type MessageText, type TextSearch } from "../../imap/textsearch.js";
 import { listMailboxes, liveMailboxStatus, refreshMailboxCounts, type LiveMailboxStatus } from "./mailbox.js";
 import { log } from "../../util/log.js";
@@ -671,7 +672,7 @@ async function readMessageText(
     const people = [e.from, e.to, e.cc, e.bcc].flatMap((l) => l ?? []).map((a) => `${a.name ?? ""} ${a.email}`);
     out.set(uid, {
       header: [e.subject ?? "", ...people].join("\n"),
-      body: values.map(([id, v]) => (html.has(id) ? htmlToPlain(v.value) : v.value)).join("\n"),
+      body: values.map(([id, v]) => (html.has(id) ? htmlToSearchText(v.value) : v.value)).join("\n"),
     });
   }
   return out;

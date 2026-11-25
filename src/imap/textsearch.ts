@@ -107,7 +107,9 @@ export interface MessageText {
   body: string;
 }
 
-const fold = (s: string): string => s.normalize("NFC").toLowerCase().replace(/\s+/g, " ");
+// Soft hyphens and zero-width characters show nothing and may stand anywhere.
+const fold = (s: string): string =>
+  s.replace(/[\u00ad\u200b-\u200d\u2060\ufeff]/g, "").normalize("NFC").toLowerCase().replace(/\s+/g, " ");
 
 /** RFC 8621 §4.4.1 `text` and `body` over a message that was read. */
 export function matchesText(filters: Filter[], m: MessageText): boolean {
