@@ -5,6 +5,13 @@
 import { JmapError } from "../jmap/errors.js";
 import { log } from "../util/log.js";
 
+/**
+ * How long one step of a full-text search may take before the folder counts as
+ * one the server does not search (seen: a server that answers in 50 ms for some
+ * folders and never for others, whatever their size).
+ */
+export const textStepMs = (): number => Number(process.env.IMAP_TEXT_STEP_TIMEOUT_MS ?? 2_500);
+
 /** How long a SEARCH may take. Read per call so that tests can shorten it. */
 /**
  * How long a full-text search may take over all its folders. Below the 30 s

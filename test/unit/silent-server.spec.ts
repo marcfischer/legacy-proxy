@@ -8,6 +8,7 @@ import fs from "node:fs";
 import http from "node:http";
 import net from "node:net";
 import type { FastifyInstance } from "fastify";
+import { resetTextSearch } from "../../src/imap/textsearch.js";
 import { bootProxy, type FakeImap } from "./fake-imap.js";
 
 const FOLDERS = ["INBOX", "Archive", "Projects", "Receipts"];
@@ -19,10 +20,13 @@ let accountId = "";
 /** Connections with an unanswered full-text search, now and at most. */
 const silent = { now: 0, most: 0, total: 0 };
 let answerText = false;
+let readable = false;
+const LINE = "Guten Tag, anbei die RECHNUNG.";
 
 beforeAll(async () => {
   process.env.IMAP_TEXT_SEARCH_TIMEOUT_MS = "1500";
   process.env.IMAP_POOL_WAIT_MS = "1000";
+  process.env.IMAP_TEXT_STEP_TIMEOUT_MS = "200";
   server = net.createServer((sock) => {
     let waiting = false;
     sock.on("error", () => {});
@@ -46,7 +50,13 @@ beforeAll(async () => {
           silent.total++;
           silent.most = Math.max(silent.most, ++silent.now);
         } else if (cmd === "SEARCH") sock.write(`* SEARCH 1\r\n${tag} OK\r\n`);
-        else if (cmd === "FETCH") sock.write(`* 1 FETCH (UID 1 INTERNALDATE "01-Jan-2026 00:00:00 +0000")\r\n${tag} OK\r\n`);
+        else if (cmd === "FETCH" && readable) {
+          const parts = [...line.matchAll(/BODY(?:\.PEEK)?\[(1(?:\.TEXT)?)\]/g)].map(() => ` BODY[1] {${LINE.length}}\r\n${LINE}`).join("");
+          sock.write(
+            `* 1 FETCH (UID 1 FLAGS () RFC822.SIZE 100 INTERNALDATE "01-Jan-2026 00:00:00 +0000" ENVELOPE (NIL "Betreff" NIL NIL NIL NIL NIL NIL NIL "<a@b>")` +
+              ` BODYSTRUCTURE ("TEXT" "PLAIN" ("CHARSET" "utf-8") NIL NIL "7BIT" ${LINE.length} 1 NIL NIL NIL NIL)${parts})\r\n${tag} OK\r\n`,
+          );
+        } else if (cmd === "FETCH") sock.write(`* 1 FETCH (UID 1 INTERNALDATE "01-Jan-2026 00:00:00 +0000")\r\n${tag} OK\r\n`);
         else if (cmd === "LOGOUT") sock.end(`* BYE\r\n${tag} OK\r\n`);
         else sock.write(`${tag} OK\r\n`);
       }
@@ -62,6 +72,7 @@ beforeAll(async () => {
 afterAll(async () => {
   delete process.env.IMAP_TEXT_SEARCH_TIMEOUT_MS;
   delete process.env.IMAP_POOL_WAIT_MS;
+  delete process.env.IMAP_TEXT_STEP_TIMEOUT_MS;
   await app.close();
   server.close();
   fs.rmSync(dir, { recursive: true, force: true });
@@ -72,6 +83,7 @@ const allClosed = async () => {
 };
 beforeEach(async () => {
   await allClosed();
+  resetTextSearch();
   answerText = false;
   Object.assign(silent, { most: 0, total: 0 });
 });
@@ -104,6 +116,16 @@ it("answers folders and keyword queries while several text searches get no answe
   expect(await allClosed()).toBe(true);
 }, 30_000);
 
+it("finds the messages by reading them when the server never searches their text", async () => {
+  readable = true;
+  const hit = await call("Email/query", { filter: { text: "rechnung anbei" }, calculateTotal: true });
+  expect(hit.call[0]).toBe("Email/query");
+  expect(hit.call[1].total).toBe(4);
+  expect((await call("Email/query", { filter: { body: "betreff" }, calculateTotal: true })).call[1].total).toBe(0);
+  expect((await call("Email/query", { filter: { text: "betreff" }, calculateTotal: true })).call[1].total).toBe(4);
+  readable = false;
+}, 30_000);
+
 it("works again, with every hit, once the server answers", async () => {
   answerText = true;
   const r = await call("Email/query", { filter: { text: "one" }, calculateTotal: true });
@@ -124,6 +146,7 @@ it("searches one folder for text without an interactive connection", async () =>
 
 it("ends a search, and its connection, when the browser closes the request", async () => {
   process.env.IMAP_TEXT_SEARCH_TIMEOUT_MS = "20000";
+  process.env.IMAP_TEXT_STEP_TIMEOUT_MS = "20000";
   const req = http.request(`${url}/jmap`, { method: "POST", headers: { authorization: AUTH, "content-type": "application/json" } });
   req.on("error", () => {});
   req.end(body("Email/query", { filter: { text: "closed" } }));
@@ -133,4 +156,5 @@ it("ends a search, and its connection, when the browser closes the request", asy
   expect(await allClosed()).toBe(true);
   expect(silent.total).toBe(1);
   process.env.IMAP_TEXT_SEARCH_TIMEOUT_MS = "1500";
+  process.env.IMAP_TEXT_STEP_TIMEOUT_MS = "200";
 }, 30_000);

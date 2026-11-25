@@ -11,8 +11,8 @@ import type { ImapFlow } from "imapflow";
 import { JmapError } from "../jmap/errors.js";
 import { log } from "../util/log.js";
 import { searchedUids } from "./busy.js";
-import { withDeadline } from "./deadline.js";
-import { compileFilter, type Filter, type FilterCondition } from "./search.js";
+import { textStepMs, withDeadline } from "./deadline.js";
+import { compileFilter, searchTokens, type Filter, type FilterCondition } from "./search.js";
 import { uidSets } from "./uids.js";
 
 const FIRST_STEP = 50;
@@ -67,7 +67,41 @@ function knownFor(key: string): Known {
 }
 
 /** For tests. */
-export const resetTextSearch = (): void => known.clear();
+export const resetTextSearch = (): void => {
+  known.clear();
+  stalled.clear();
+};
+
+/** The server left a step unanswered. Its connection is closed; a new try reads the messages instead. */
+export class TextSearchStalled extends JmapError {
+  constructor(folder: string) {
+    super("serverUnavailable", `the mail server does not search the text of ${folder}`);
+  }
+}
+
+// Folders whose text the server did not search, and until when not to ask it.
+const stalled = new Map<string, number>();
+const STALLED_MS = 5 * 60_000;
+
+/** What a message offers a search, decoded. */
+export interface MessageText {
+  /** Subject and addresses. */
+  header: string;
+  body: string;
+}
+
+const fold = (s: string): string => s.normalize("NFC").toLowerCase().replace(/\s+/g, " ");
+
+/** RFC 8621 §4.4.1 `text` and `body` over a message that was read. */
+export function matchesText(filters: Filter[], m: MessageText): boolean {
+  const body = fold(m.body);
+  const all = `${fold(m.header)}\n${body}`;
+  const has = (words: string, where: string) => searchTokens(words).every((t) => where.includes(fold(t)));
+  return filters.every((f) => {
+    const c = f as FilterCondition;
+    return (c.text === undefined || has(c.text, all)) && (c.body === undefined || has(c.body, body));
+  });
+}
 
 export interface TextSearch {
   filter: Filter;
@@ -78,6 +112,8 @@ export interface TextSearch {
   signal?: AbortSignal;
   /** Drops candidates known not to match, before their text is searched. */
   narrow?: (uids: number[]) => number[];
+  /** Reads messages, to search those of a folder the server does not. */
+  read?: (client: ImapFlow, uids: number[]) => Promise<Map<number, MessageText>>;
 }
 
 /** Ascending UIDs matching `s.filter` in the open folder, or null when it can't be split. */
@@ -86,13 +122,12 @@ export async function searchText(client: ImapFlow, s: TextSearch): Promise<numbe
   if (!parts || parts.text.length === 0) return null;
   const open = typeof client.mailbox === "object" && client.mailbox ? client.mailbox : null;
   const t0 = Date.now();
-  const search = async (query: Record<string, unknown>, what: string): Promise<number[]> => {
-    if (Date.now() >= s.until) {
-      throw new JmapError("serverUnavailable", "the mail server takes too long to search the text of all messages");
-    }
+  const tooLong = () => new JmapError("serverUnavailable", "the mail server takes too long to search the text of all messages");
+  const search = async (query: Record<string, unknown>, what: string, limit = s.until - Date.now()): Promise<number[]> => {
+    if (Date.now() >= s.until) throw tooLong();
     return searchedUids(
       client,
-      await withDeadline(client, s.until - Date.now(), `${what} in ${open?.path ?? ""}`, () => client.search(query, { uid: true }), s.signal),
+      await withDeadline(client, Math.max(1, limit), `${what} in ${open?.path ?? ""}`, () => client.search(query, { uid: true }), s.signal),
     );
   };
 
@@ -104,14 +139,36 @@ export async function searchText(client: ImapFlow, s: TextSearch): Promise<numbe
   // An empty text matches everything, and needs nothing read.
   const todo = Object.keys(text).length === 0 ? [] : candidates.filter((uid) => !k.searched.has(uid)).sort((a, b) => b - a);
   const before = candidates.length - todo.length;
+  const reading = s.read !== undefined && (stalled.get(s.folderKey) ?? 0) > Date.now();
   let done = 0;
+
+  const askServer = async (uids: number[]): Promise<void> => {
+    for (const set of uidSets(uids)) {
+      const asked = Date.now();
+      const limit = s.read ? Math.min(textStepMs(), s.until - asked) : s.until - asked;
+      try {
+        for (const uid of await search({ uid: set, ...text }, `text SEARCH of ${uids.length} messages`, limit)) k.matched.add(uid);
+      } catch (e) {
+        if (!s.read || s.signal?.aborted || Date.now() - asked < textStepMs()) throw e;
+        stalled.set(s.folderKey, Date.now() + STALLED_MS);
+        throw new TextSearchStalled(open?.path ?? "");
+      }
+    }
+  };
+  const readThem = async (uids: number[]): Promise<void> => {
+    if (Date.now() >= s.until) throw tooLong();
+    const what = `reading ${uids.length} messages in ${open?.path ?? ""}`;
+    const texts = await withDeadline(client, s.until - Date.now(), what, () => s.read!(client, uids), s.signal);
+    // None at all is a connection or server that failed, not a step without matches.
+    if (texts.size === 0) throw new JmapError("serverUnavailable", "the messages to search could not be read");
+    if (texts.size < uids.length) log.warn({ mailbox: open?.path, missing: uids.length - texts.size }, "text search: messages could not be read");
+    for (const [uid, m] of texts) if (matchesText(parts.text, m)) k.matched.add(uid);
+  };
   try {
     for (let step = FIRST_STEP; done < todo.length; ) {
       const uids = todo.slice(done, done + step);
       const started = Date.now();
-      for (const set of uidSets(uids)) {
-        for (const uid of await search({ uid: set, ...text }, `text SEARCH of ${uids.length} messages`)) k.matched.add(uid);
-      }
+      await (reading ? readThem(uids) : askServer(uids));
       for (const uid of uids) k.searched.add(uid);
       done += uids.length;
       if (Date.now() - started < STEP_TARGET_MS) step = Math.min(step * 2, MAX_STEP);
@@ -120,7 +177,7 @@ export async function searchText(client: ImapFlow, s: TextSearch): Promise<numbe
     const ms = Date.now() - t0;
     if (ms >= 1_000) {
       log.info(
-        { mailbox: open?.path, messages: open?.exists, criteria: inFolder.length, candidates: candidates.length, known: before, searched: done, left: todo.length - done, ms },
+        { mailbox: open?.path, messages: open?.exists, criteria: inFolder.length, candidates: candidates.length, reading, known: before, searched: done, left: todo.length - done, ms },
         "slow text search in folder",
       );
     }

@@ -3,7 +3,7 @@ import type { AccountRow, Store, EmailCacheUpsert } from "../../state/store.js";
 import type { ImapPool } from "../../imap/pool.js";
 import { decodeEmailId, decodeMailboxId, encodeBlobId, encodeEmailId, encodeMailboxId } from "../../mapping/ids.js";
 import { encodeEmailState } from "../../state/states.js";
-import { dateMs, fetchEmailsBatch, isoDate, type JmapEmail } from "../../imap/fetcher.js";
+import { dateMs, fetchEmailsBatch, htmlToPlain, isoDate, type JmapEmail } from "../../imap/fetcher.js";
 import { gotNoConnection, isCommandRefusal, MailServerBusy, searchedUids } from "../../imap/busy.js";
 import { searchTimeoutMs, textSearchMs, withDeadline } from "../../imap/deadline.js";
 import { clientSignal, throwIfClientGone } from "../abort.js";
@@ -11,7 +11,7 @@ import { imapErrorDetails, withMailbox } from "../../imap/client.js";
 import { fetchByUid } from "../../imap/uids.js";
 import { JmapError, accountNotFound, invalidArguments, notFound, unsupportedFilter, unsupportedSort } from "../errors.js";
 import { compileFilter, UnsupportedFilter, type Filter } from "../../imap/search.js";
-import { searchesText, searchText, type TextSearch } from "../../imap/textsearch.js";
+import { searchesText, searchText, TextSearchStalled, type MessageText, type TextSearch } from "../../imap/textsearch.js";
 import { listMailboxes, liveMailboxStatus, refreshMailboxCounts, type LiveMailboxStatus } from "./mailbox.js";
 import { log } from "../../util/log.js";
 import { mapWithConcurrency } from "../../util/concurrency.js";
@@ -386,7 +386,11 @@ export async function emailQuery(
     ? pool && lend && searchesText(filter)
       ? await lend(() => oneTextScan(ctx.account.id, () => {
           throwIfClientGone();
-          return pool.withConnection(ctx.account, "bulk", (client) => single({ ...ctx, client }));
+          const once = () => pool.withConnection(ctx.account, "bulk", (client) => single({ ...ctx, client }));
+          return once().catch((e) => {
+            if (e instanceof TextSearchStalled) return once();
+            throw e;
+          });
         }))
       : await single(ctx)
     : await emailQueryAccountWideFull(ctx, filter, imapFilter, sort, ascending, needsFetch, textUntil);
@@ -645,6 +649,34 @@ function bodyStructureHasAttachment(bs: unknown): boolean {
   return false;
 }
 
+/** What `text` and `body` conditions match, for messages of the open folder. */
+async function readMessageText(
+  client: ImapFlow,
+  ctx: MailCtx,
+  mailboxIdx: number,
+  uidvalidity: number,
+  uids: number[],
+): Promise<Map<number, MessageText>> {
+  const row = ctx.store
+    .prep(`SELECT * FROM mailbox WHERE id = ? AND account_id = ?`)
+    .get(mailboxIdx, ctx.account.id) as object;
+  const opts = { fetchTextBodyValues: true, fetchHTMLBodyValues: true, maxBodyValueBytes: 10_000_000, wantsPreview: false };
+  const emails = await fetchEmailsBatch(client, ctx.account, { ...row, uidvalidity } as never, uids, opts, ctx.store);
+  const out = new Map<number, MessageText>();
+  for (const [uid, e] of emails) {
+    const values = Object.entries(e.bodyValues);
+    // A part that did not arrive may hold the match.
+    if (values.some(([, v]) => v.isEncodingProblem)) continue;
+    const html = new Set(e.htmlBody.filter((p) => p.type === "text/html").map((p) => p.partId));
+    const people = [e.from, e.to, e.cc, e.bcc].flatMap((l) => l ?? []).map((a) => `${a.name ?? ""} ${a.email}`);
+    out.set(uid, {
+      header: [e.subject ?? "", ...people].join("\n"),
+      body: values.map(([id, v]) => (html.has(id) ? htmlToPlain(v.value) : v.value)).join("\n"),
+    });
+  }
+  return out;
+}
+
 /** What a full-text search of the folder needs; null for any other search, and for Gmail's index. */
 function textSearch(
   ctx: MailCtx,
@@ -660,6 +692,7 @@ function textSearch(
     until,
     folderKey: `${ctx.account.id}|${mailboxIdx}|${uidvalidity}`,
     signal: clientSignal(),
+    read: (client, uids) => readMessageText(client, ctx, mailboxIdx, uidvalidity, uids),
     // IMAP has no criterion for attachments, but the cache knows most messages.
     narrow:
       want === null
@@ -935,7 +968,8 @@ async function emailQueryAccountWideFull(
       return scanFolder(t.idx, t.row, client);
     });
   const lend = text && ctx.pool ? ctx.lend : undefined;
-  const scanAll = () => mapWithConcurrency(targets, ACCOUNT_SCAN_CONCURRENCY, async (t) => {
+  const deferred: typeof targets = [];
+  const scanList = (list: typeof targets, again: boolean) => mapWithConcurrency(list, ACCOUNT_SCAN_CONCURRENCY, async (t) => {
     if (failure) return [] as SortableHit[];
     const cached = fromCache(t.idx, t.row);
     if (cached) {
@@ -964,7 +998,9 @@ async function emailQueryAccountWideFull(
     // Noted inside the turn: the next folder's begins as soon as this one ends.
     const noted = (): Promise<SortableHit[]> =>
       scan().catch((e) => {
-        if (!isCommandRefusal(e)) failure ??= { error: e };
+        // The folders the server does search come first; this one is read after them.
+        if (e instanceof TextSearchStalled && !again) deferred.push(t);
+        else if (!isCommandRefusal(e)) failure ??= { error: e };
         throw e;
       });
     try {
@@ -972,6 +1008,7 @@ async function emailQueryAccountWideFull(
       answered++;
       return found;
     } catch (e) {
+      if (e instanceof TextSearchStalled && !again) return [] as SortableHit[];
       if (!isCommandRefusal(e)) {
         failure ??= { error: e };
         return [] as SortableHit[];
@@ -988,6 +1025,7 @@ async function emailQueryAccountWideFull(
       return [] as SortableHit[];
     }
   });
+  const scanAll = async () => [...(await scanList(targets, false)), ...(await scanList(deferred, true))];
   // The scan runs on bulk connections; a text search takes too long to hold an
   // interactive one meanwhile.
   const perFolder = lend ? await lend(scanAll) : await scanAll();

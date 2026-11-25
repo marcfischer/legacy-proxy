@@ -1,11 +1,13 @@
 // A full-text search asks the server to read as few messages as possible, in
 // small steps, and does not lose what it learned when its time runs out.
 
-import { beforeEach, expect, it } from "vitest";
+import { afterAll, beforeEach, expect, it } from "vitest";
 import type { ImapFlow } from "imapflow";
-import { resetTextSearch, searchText, splitTextFilter } from "../../src/imap/textsearch.js";
+import { matchesText, resetTextSearch, searchText, splitTextFilter, TextSearchStalled, type MessageText } from "../../src/imap/textsearch.js";
 
 process.env.LOG_LEVEL = "silent";
+process.env.IMAP_TEXT_STEP_TIMEOUT_MS = "150";
+afterAll(() => { delete process.env.IMAP_TEXT_STEP_TIMEOUT_MS; });
 beforeEach(() => resetTextSearch());
 
 const expand = (set: string) =>
@@ -79,4 +81,49 @@ it("leaves an OR or NOT with text to one SEARCH", async () => {
     cheap: [{ operator: "OR", conditions: [{ from: "b" }, { to: "c" }] }],
     text: [{ text: "a" }],
   });
+});
+
+/** A server that answers other searches and never one for text. */
+function silentServer(count: number) {
+  const c = server(count);
+  const plain = c.search;
+  c.search = async (q: { uid?: string }) => (q.uid === undefined ? plain(q) : new Promise<number[]>(() => {}));
+  return c;
+}
+const reader = (reads: number[][]) => async (_c: unknown, uids: number[]) => {
+  reads.push(uids);
+  return new Map<number, MessageText>(uids.map((u) => [u, { header: "Subject", body: u % 10 === 0 ? "the WORD here" : "nothing" }]));
+};
+
+it("reads the messages itself in a folder whose text the server does not search", async () => {
+  const reads: number[][] = [];
+  const first = silentServer(100);
+  await expect(run(first, { text: "word" }, { read: reader(reads) })).rejects.toBeInstanceOf(TextSearchStalled);
+  expect(first.closed).toBe(true);
+  // The next try does not ask the server for text again.
+  expect(await run(silentServer(100), { text: "word" }, { read: reader(reads) })).toEqual([10, 20, 30, 40, 50, 60, 70, 80, 90, 100]);
+  expect(reads[0]![0]).toBe(100);
+  expect(reads.flat()).toHaveLength(100);
+  // Another folder is asked.
+  const other = server(20);
+  expect(await run(other, { text: "word" }, { read: reader(reads), folderKey: "g" })).toEqual([10, 20]);
+  expect(other.read).toHaveLength(20);
+});
+
+it("fails, and remembers nothing, when the messages cannot be read", async () => {
+  const none = async () => new Map<number, MessageText>();
+  await expect(run(silentServer(20), { text: "word" }, { read: none })).rejects.toBeInstanceOf(TextSearchStalled);
+  await expect(run(silentServer(20), { text: "word" }, { read: none })).rejects.toMatchObject({ type: "serverUnavailable" });
+  expect(await run(silentServer(20), { text: "word" }, { read: reader([]) })).toEqual([10, 20]);
+});
+
+it("matches text in subject, addresses and body, and body in the body alone", () => {
+  const m = { header: "Jahresbericht\nMax Müller max@example.org", body: "Der Leistungs-\n nachweis ist da" };
+  expect(matchesText([{ text: "JAHRESBERICHT müller" }], m)).toBe(true);
+  expect(matchesText([{ text: "max da" }], m)).toBe(true);
+  expect(matchesText([{ text: "max fehlt" }], m)).toBe(false);
+  expect(matchesText([{ body: "müller" }], m)).toBe(false);
+  expect(matchesText([{ body: '"nachweis ist"' }], m)).toBe(true);
+  expect(matchesText([{ body: '"ist nachweis"' }], m)).toBe(false);
+  expect(matchesText([{ text: "müller" }, { body: "da" }], m)).toBe(true);
 });

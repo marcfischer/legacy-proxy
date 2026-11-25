@@ -184,9 +184,14 @@ function compileTextTokens(s: string, key: "text" | "body" = "text"): ImapSearch
   // and all of them must match. IMAP SEARCH does substring matching with no
   // wildcard support; `*` and `?` would be sent literally and never match, as
   // would the quotes.
-  const tokens = [...s.matchAll(/"([^"]*)"|[^\s"]+/g)]
-    .map(([all, phrase]) => (phrase !== undefined ? phrase.trim() : all.replace(/[*?]/g, "")))
-    .filter(Boolean);
+  const tokens = searchTokens(s);
   if (tokens.length === 0) return {};
   return mergeAnd(tokens.map((t) => ({ [key]: t })));
+}
+
+/** The words and quoted phrases of a search, all of which must match. */
+export function searchTokens(s: string): string[] {
+  return [...s.matchAll(/"([^"]*)"|[^\s"]+/g)]
+    .map(([all, phrase]) => (phrase !== undefined ? phrase.trim() : all.replace(/[*?]/g, "")))
+    .filter(Boolean);
 }

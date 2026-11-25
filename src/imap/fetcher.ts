@@ -111,7 +111,7 @@ function decodeTransferEncoding(buf: Buffer, encoding: string | null): Buffer {
   return buf;
 }
 
-function htmlToPlain(html: string): string {
+export function htmlToPlain(html: string): string {
   return html
     .replace(/<style[\s\S]*?<\/style>/gi, " ")
     .replace(/<script[\s\S]*?<\/script>/gi, " ")
