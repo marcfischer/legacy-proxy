@@ -6,6 +6,12 @@ import { JmapError } from "../jmap/errors.js";
 import { log } from "../util/log.js";
 
 /** How long a SEARCH may take. Read per call so that tests can shorten it. */
+/**
+ * How long a full-text search may take over all its folders. Below the 30 s
+ * after which the webmail stops waiting, so that it gets an answer.
+ */
+export const textSearchMs = (): number => Number(process.env.IMAP_TEXT_SEARCH_TIMEOUT_MS ?? 25_000);
+
 export const searchTimeoutMs = (): number => Number(process.env.IMAP_SEARCH_TIMEOUT_MS ?? 60_000);
 
 /**

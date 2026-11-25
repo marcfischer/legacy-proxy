@@ -62,24 +62,37 @@ export function compileFilter(filter: Filter, opts: CompileOpts = {}): ImapSearc
   return compileLeaf(filter as FilterCondition, opts);
 }
 
-// `Object.assign({}, ...parts)` clobbers earlier keys; that's wrong when two
-// AND branches both contribute (say) `gmraw` — the second wins and the first
-// is dropped. Combine duplicate scalar keys into a single space-joined string,
-// which is how Gmail X-GM-RAW expects multiple terms anded together.
+// A SearchObject carries each key once, so two conditions on the same key
+// cannot simply be merged: the second would replace the first. Gmail X-GM-RAW
+// terms are joined into one string, which is how it ANDs them; anything else
+// goes out as A AND B = NOT (NOT A OR NOT B), which imapflow compiles.
 function mergeAnd(parts: ImapSearch[]): ImapSearch {
-  const out: ImapSearch = {};
+  const values = new Map<string, unknown[]>();
   for (const p of parts) {
     for (const [k, v] of Object.entries(p)) {
-      if (k === "gmraw" && typeof out[k] === "string" && typeof v === "string") {
-        out[k] = `${out[k]} ${v}`;
-      } else if (out[k] !== undefined && Array.isArray(out[k]) && Array.isArray(v)) {
-        out[k] = [...(out[k] as unknown[]), ...v];
-      } else {
-        out[k] = v;
-      }
+      const seen = values.get(k) ?? [];
+      if (!seen.some((x) => JSON.stringify(x) === JSON.stringify(v))) seen.push(v);
+      values.set(k, seen);
     }
   }
+  const out: ImapSearch = {};
+  const negated: ImapSearch[] = [];
+  for (const [k, vs] of values) {
+    if (vs.length === 1) out[k] = vs[0];
+    else if (k === "gmraw") out[k] = vs.join(" ");
+    else if (k === "not") for (const v of vs) negated.push(...orTerms(v as ImapSearch));
+    else for (const v of vs) negated.push({ not: { [k]: v } });
+  }
+  if (negated.length > 0) {
+    if (out.not !== undefined) negated.push(...orTerms(out.not as ImapSearch));
+    out.not = { or: negated };
+  }
   return out;
+}
+
+/** The alternatives of a lone `or`, so that nested ones stay flat. */
+function orTerms(s: ImapSearch): ImapSearch[] {
+  return Object.keys(s).length === 1 && Array.isArray(s.or) ? (s.or as ImapSearch[]) : [s];
 }
 
 function compileLeaf(c: FilterCondition, opts: CompileOpts): ImapSearch {
@@ -116,7 +129,7 @@ function compileLeaf(c: FilterCondition, opts: CompileOpts): ImapSearch {
     gmail
       ? appendGmRaw(out, `subject:${quoteGmail(c.subject)}`)
       : (out.subject = c.subject);
-  if (c.body) gmail ? appendGmRaw(out, quoteGmail(c.body)) : (out.body = c.body);
+  if (c.body) gmail ? appendGmRaw(out, quoteGmail(c.body)) : Object.assign(out, mergeAnd([out, compileTextTokens(c.body, "body")]));
   if (c.header) {
     const [name, value] = c.header;
     out.header = { [name]: value ?? "" };
@@ -166,15 +179,14 @@ function quoteGmail(s: string): string {
   return s;
 }
 
-function compileTextTokens(s: string): ImapSearch {
-  // IMAP SEARCH does substring matching with no wildcard support; `*` and `?`
-  // are sent literally and never match. Strip them and split on whitespace so
-  // each remaining token becomes its own TEXT criterion.
-  const tokens = s.split(/\s+/).map((t) => t.replace(/[*?]/g, "")).filter(Boolean);
+function compileTextTokens(s: string, key: "text" | "body" = "text"): ImapSearch {
+  // RFC 8621 §4.4.1: a quoted part is one phrase, every other word a token,
+  // and all of them must match. IMAP SEARCH does substring matching with no
+  // wildcard support; `*` and `?` would be sent literally and never match, as
+  // would the quotes.
+  const tokens = [...s.matchAll(/"([^"]*)"|[^\s"]+/g)]
+    .map(([all, phrase]) => (phrase !== undefined ? phrase.trim() : all.replace(/[*?]/g, "")))
+    .filter(Boolean);
   if (tokens.length === 0) return {};
-  if (tokens.length === 1) return { text: tokens[0] };
-  // A SearchObject can only carry one `text` key, so we can't AND multiple TEXT
-  // criteria directly. De Morgan: A ∧ B ∧ … = ¬(¬A ∨ ¬B ∨ …), which imapflow's
-  // not/or compiler emits correctly.
-  return { not: { or: tokens.map((t) => ({ not: { text: t } })) } };
+  return mergeAnd(tokens.map((t) => ({ [key]: t })));
 }

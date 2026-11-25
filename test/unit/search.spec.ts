@@ -70,4 +70,34 @@ describe("Email/query filter compiler", () => {
       gmraw: "-has:attachment",
     });
   });
+
+  it("keeps every condition of an AND on the same key", () => {
+    expect(compileFilter({ operator: "AND", conditions: [{ from: "a" }, { from: "b" }] })).toEqual({
+      not: { or: [{ not: { from: "a" } }, { not: { from: "b" } }] },
+    });
+    // Other keys, and conditions that repeat, stay as they are.
+    expect(compileFilter({ operator: "AND", conditions: [{ from: "a" }, { subject: "s" }, { from: "a" }] })).toEqual({ from: "a", subject: "s" });
+    expect(compileFilter({ operator: "AND", conditions: [{ text: "a b" }, { text: "c d" }, { notKeyword: "$seen" }] })).toEqual({
+      unseen: true,
+      not: { or: ["a", "b", "c", "d"].map((t) => ({ not: { text: t } })) },
+    });
+  });
+
+  it("keeps a NOT next to a multi-word text", () => {
+    expect(compileFilter({ operator: "AND", conditions: [{ operator: "NOT", conditions: [{ from: "a" }] }, { text: "b c" }] })).toEqual({
+      not: { or: [{ from: "a" }, { not: { text: "b" } }, { not: { text: "c" } }] },
+    });
+  });
+
+  it("takes a quoted part as one phrase, without its quotes", () => {
+    expect(compileFilter({ text: '"annual report"' })).toEqual({ text: "annual report" });
+    expect(compileFilter({ body: '"annual report" 2026' })).toEqual({
+      not: { or: [{ not: { body: "annual report" } }, { not: { body: "2026" } }] },
+    });
+  });
+
+  it("matches the words of `body` one by one, like those of `text`", () => {
+    expect(compileFilter({ body: "invoice" })).toEqual({ body: "invoice" });
+    expect(compileFilter({ body: "invoice may" })).toEqual({ not: { or: [{ not: { body: "invoice" } }, { not: { body: "may" } }] } });
+  });
 });

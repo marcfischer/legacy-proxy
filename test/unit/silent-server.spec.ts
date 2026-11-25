@@ -21,7 +21,7 @@ const silent = { now: 0, most: 0, total: 0 };
 let answerText = false;
 
 beforeAll(async () => {
-  process.env.IMAP_SEARCH_TIMEOUT_MS = "1500";
+  process.env.IMAP_TEXT_SEARCH_TIMEOUT_MS = "1500";
   process.env.IMAP_POOL_WAIT_MS = "1000";
   server = net.createServer((sock) => {
     let waiting = false;
@@ -60,7 +60,7 @@ beforeAll(async () => {
   accountId = Object.keys(session.json().accounts)[0]!;
 }, 30_000);
 afterAll(async () => {
-  delete process.env.IMAP_SEARCH_TIMEOUT_MS;
+  delete process.env.IMAP_TEXT_SEARCH_TIMEOUT_MS;
   delete process.env.IMAP_POOL_WAIT_MS;
   await app.close();
   server.close();
@@ -97,8 +97,10 @@ it("answers folders and keyword queries while several text searches get no answe
   expect(silent.most).toBe(1);
   // Each search ends as an error, never as a result without hits.
   for (const s of await Promise.all(searches)) expect(s.call[0]).toBe("error");
-  // One folder each: the first failure ends a search.
-  expect(silent.total).toBe(4);
+  // At most one folder each, the first failure ends a search; one whose time
+  // ran out while it waited its turn asks the server nothing.
+  expect(silent.total).toBeGreaterThanOrEqual(1);
+  expect(silent.total).toBeLessThanOrEqual(4);
   expect(await allClosed()).toBe(true);
 }, 30_000);
 
@@ -121,7 +123,7 @@ it("searches one folder for text without an interactive connection", async () =>
 }, 30_000);
 
 it("ends a search, and its connection, when the browser closes the request", async () => {
-  process.env.IMAP_SEARCH_TIMEOUT_MS = "20000";
+  process.env.IMAP_TEXT_SEARCH_TIMEOUT_MS = "20000";
   const req = http.request(`${url}/jmap`, { method: "POST", headers: { authorization: AUTH, "content-type": "application/json" } });
   req.on("error", () => {});
   req.end(body("Email/query", { filter: { text: "closed" } }));
@@ -130,5 +132,5 @@ it("ends a search, and its connection, when the browser closes the request", asy
   req.destroy();
   expect(await allClosed()).toBe(true);
   expect(silent.total).toBe(1);
-  process.env.IMAP_SEARCH_TIMEOUT_MS = "1500";
+  process.env.IMAP_TEXT_SEARCH_TIMEOUT_MS = "1500";
 }, 30_000);

@@ -5,7 +5,7 @@ import { decodeEmailId, decodeMailboxId, encodeBlobId, encodeEmailId, encodeMail
 import { encodeEmailState } from "../../state/states.js";
 import { dateMs, fetchEmailsBatch, isoDate, type JmapEmail } from "../../imap/fetcher.js";
 import { gotNoConnection, isCommandRefusal, MailServerBusy, searchedUids } from "../../imap/busy.js";
-import { searchTimeoutMs, withDeadline } from "../../imap/deadline.js";
+import { searchTimeoutMs, textSearchMs, withDeadline } from "../../imap/deadline.js";
 import { clientSignal, throwIfClientGone } from "../abort.js";
 import { imapErrorDetails, withMailbox } from "../../imap/client.js";
 import { fetchByUid } from "../../imap/uids.js";
@@ -172,7 +172,8 @@ async function cachedSearch(
   cacheKey: string,
   imapFilter: ReturnType<typeof compileFilter>,
   wasOpen: boolean,
-  text: boolean,
+  /** When a full-text search has to be done by; null for any other. */
+  textUntil: number | null,
   onSearched?: (uids: number[]) => void,
 ): Promise<number[]> {
   const emailState = store.getState(accountId, "email");
@@ -180,17 +181,22 @@ async function cachedSearch(
   if (cached && cached.modseq === openModseq(client) && cached.emailState === emailState && cached.expiresAt > Date.now()) {
     return cached.uids;
   }
+  const open = typeof client.mailbox === "object" && client.mailbox ? client.mailbox : null;
+  const t0 = Date.now();
   // A full-text search is long enough to be worth a connection to stop.
   const searchResult = await withDeadline(
     client,
-    searchTimeoutMs(),
-    "SEARCH",
+    textUntil === null ? searchTimeoutMs() : Math.max(1, textUntil - t0),
+    `SEARCH ${open?.path ?? ""} (${open?.exists ?? "?"} messages)`,
     async () => {
       if (wasOpen) await client.noop();
       return await client.search(imapFilter, { uid: true });
     },
-    text ? clientSignal() : undefined,
+    textUntil === null ? undefined : clientSignal(),
   );
+  if (textUntil !== null && Date.now() - t0 >= 1_000) {
+    log.info({ mailbox: open?.path, messages: open?.exists, ms: Date.now() - t0 }, "slow text search in folder");
+  }
   const uids = searchedUids(client, searchResult);
   onSearched?.(uids);
   searchCache.set(cacheKey, {
@@ -374,8 +380,9 @@ export async function emailQuery(
   const lim = Math.min(args.limit ?? 50, 500);
 
   const inMailbox = findInMailbox(filter);
+  const textUntil = searchesText(filter) ? t0 + textSearchMs() : null;
   const { pool, lend } = ctx;
-  const single = (c: MailCtx) => emailQuerySingleMailboxFull(c, filter, imapFilter, inMailbox!, sort, ascending, needsFetch);
+  const single = (c: MailCtx) => emailQuerySingleMailboxFull(c, filter, imapFilter, inMailbox!, sort, ascending, needsFetch, textUntil);
   const full = inMailbox
     ? pool && lend && searchesText(filter)
       ? await lend(() => oneTextScan(ctx.account.id, () => {
@@ -383,7 +390,7 @@ export async function emailQuery(
           return pool.withConnection(ctx.account, "bulk", (client) => single({ ...ctx, client }));
         }))
       : await single(ctx)
-    : await emailQueryAccountWideFull(ctx, filter, imapFilter, sort, ascending, needsFetch);
+    : await emailQueryAccountWideFull(ctx, filter, imapFilter, sort, ascending, needsFetch, textUntil);
 
   let orderedIds = full.ids;
 
@@ -647,6 +654,7 @@ async function emailQuerySingleMailboxFull(
   sort: SortSpec[],
   ascending: boolean,
   needsFetch: boolean,
+  textUntil: number | null,
 ): Promise<{ ids: string[]; queryState: string }> {
   const m = decodeMailboxId(inMailbox);
   const mboxRow = ctx.store
@@ -662,7 +670,7 @@ async function emailQuerySingleMailboxFull(
     );
 
     const cacheKey = searchCacheKey(ctx.account.id, m.mailboxIdx, uidvalidity, filter);
-    const uids = await cachedSearch(ctx.client, ctx.store, ctx.account.id, cacheKey, imapFilter, wasOpen, searchesText(filter));
+    const uids = await cachedSearch(ctx.client, ctx.store, ctx.account.id, cacheKey, imapFilter, wasOpen, textUntil);
     let orderedUids: number[];
     // Fast path: a pure receivedAt sort (or no sort) is UID order in a single
     // mailbox — SEARCH already returned UIDs ascending, so no FETCH at all.
@@ -751,6 +759,7 @@ async function emailQueryAccountWideFull(
   sort: SortSpec[],
   ascending: boolean,
   needsFetch: boolean,
+  textUntil: number | null,
 ): Promise<{ ids: string[]; queryState: string }> {
   const otherThan = findInMailboxOtherThan(filter);
   const excludedIdxs = new Set<number>();
@@ -832,7 +841,7 @@ async function emailQueryAccountWideFull(
       const cacheKey = searchCacheKey(ctx.account.id, idx, uidvalidity, filter);
       // Only a SEARCH that just ran vouches for the modseq read before it; a
       // searchCache hit may be older than that.
-      const uids = await cachedSearch(client, ctx.store, ctx.account.id, cacheKey, imapFilter, wasOpen, searchesText(filter), (found) => {
+      const uids = await cachedSearch(client, ctx.store, ctx.account.id, cacheKey, imapFilter, wasOpen, textUntil, (found) => {
         if (liveBefore && liveBefore.uidValidity === uidvalidity) rememberFolderSearch(cacheKey, liveBefore, found);
       });
       if (uids.length === 0) return;
@@ -907,6 +916,9 @@ async function emailQueryAccountWideFull(
       // Another folder may have failed while this one waited its turn.
       if (failure) return [];
       throwIfClientGone();
+      if (textUntil !== null && Date.now() >= textUntil) {
+        throw new JmapError("serverUnavailable", "the mail server takes too long to search the text of all messages");
+      }
       // Unit-test contexts are built without a pool; fall back to the
       // request's own connection, which reproduces the old serial walk.
       if (!ctx.pool) return await scanFolder(t.idx, t.row, ctx.client);
