@@ -10,6 +10,9 @@ const storage = new AsyncLocalStorage<AbortSignal>();
 /** Run `work` so that the reads in it can stop once `signal` aborts. */
 export const runAbortable = <T>(signal: AbortSignal, work: () => Promise<T>): Promise<T> => storage.run(signal, work);
 
+/** The signal of the request being answered, when it may be given up. */
+export const clientSignal = (): AbortSignal | undefined => storage.getStore();
+
 /** Throws once the client closed the request. */
 export function throwIfClientGone(): void {
   if (storage.getStore()?.aborted) throw new JmapError("serverUnavailable", "the client closed the request");

@@ -14,8 +14,9 @@ import type { ImapPool } from "../../imap/pool.js";
 import { decodeEmailId, decodeMailboxId, encodeEmailId } from "../../mapping/ids.js";
 import { decodeEmailState, encodeEmailState } from "../../state/states.js";
 import { accountNotFound, cannotCalculateChanges } from "../errors.js";
-import { MailServerBusy, searchedUids } from "../../imap/busy.js";
+import { gotNoConnection, searchedUids } from "../../imap/busy.js";
 import { withMailbox } from "../../imap/client.js";
+import { searchTimeoutMs, withDeadline } from "../../imap/deadline.js";
 import { fetchByUid } from "../../imap/uids.js";
 import { listMailboxes, liveMailboxStatus, type LiveMailboxStatus } from "./mailbox.js";
 import { parseHeaderBlock, computeThreadIdFromHeaders } from "../../imap/headers.js";
@@ -132,7 +133,7 @@ async function syncMailboxScan(
   // count disagrees with EXISTS, ask the server for the live UID set.
   const cachedUids = store.getEmailCacheUids(account.id, mailboxId);
   if (cachedUids.length !== exists) {
-    const searchResult = exists > 0 ? await client.search({ all: true }, { uid: true }) : [];
+    const searchResult = exists > 0 ? await withDeadline(client, searchTimeoutMs(), "SEARCH", () => client.search({ all: true }, { uid: true })) : [];
     const live = new Set(searchedUids(client, searchResult));
     const stale = cachedUids.filter((uid) => !live.has(uid));
     store.deleteEmailCacheUids(account.id, mailboxId, stale);
@@ -221,7 +222,7 @@ async function rebuildThreadIndex(
   // Without a bulk connection to be had, the scan runs on the request's own.
   const lease = ctx.pool
     ? await ctx.pool.acquire(ctx.account, "bulk").catch((e) => {
-        if (e instanceof MailServerBusy) return null;
+        if (gotNoConnection(e)) return null;
         throw e;
       })
     : null;

@@ -3,7 +3,8 @@ import type { Credentials } from "../auth/credentials.js";
 import type { AppConfig } from "../util/config.js";
 import { resolveProvider } from "../auth/providers.js";
 import { openAccountCredentials } from "../auth/credentials.js";
-import { isTemporaryLoginRefusal, MailServerBusy } from "./busy.js";
+import { isTemporaryLoginRefusal, MailServerBusy, PoolWaitTimeout } from "./busy.js";
+import { withDeadline } from "./deadline.js";
 import { isCredentialRefusal, openImap } from "./client.js";
 import { nextStoredAttemptAt, type Store, type AccountRow } from "../state/store.js";
 import { log } from "../util/log.js";
@@ -71,6 +72,14 @@ const MAX_PER_ROLE: Record<PoolRole, number> = {
   bulk: 2,
 };
 
+// How long a request waits for a connection. Without a limit, requests behind
+// connections that are stuck pile up until the account's request limit refuses
+// every further one.
+const poolWaitMs = (): number => Number(process.env.IMAP_POOL_WAIT_MS ?? 20_000);
+
+// A NOOP on a connection that still works is answered at once.
+const NOOP_TIMEOUT_MS = 10_000;
+
 /** A borrowed connection. `release` must be called exactly once. */
 export interface Lease {
   client: ImapFlow;
@@ -80,7 +89,7 @@ export interface Lease {
 export class ImapPool {
   private entries = new Map<string, PoolEntry[]>();
   // Callers parked waiting for a connection to come free, per pool key.
-  private waiters = new Map<string, Array<() => void>>();
+  private waiters = new Map<string, Array<(released: boolean) => void>>();
   // Connections being opened, per pool key.
   private opening = new Map<string, number>();
   // Accounts whose stored credentials opened a connection in this process,
@@ -126,7 +135,7 @@ export class ImapPool {
     const key = `${account.id}:${role}`;
     const requestedAt = Date.now();
     for (;;) {
-      let taken: { entry: PoolEntry } | { parked: Promise<void> };
+      let taken: { entry: PoolEntry } | { parked: Promise<boolean> };
       try {
         taken = await this.takeFree(account, key, role, requestedAt);
       } catch (e) {
@@ -137,7 +146,7 @@ export class ImapPool {
       if ("entry" in taken) return this.leaseFor(key, taken.entry);
       // At the cap with everything busy: park until someone releases, then
       // re-run the whole selection (the freed entry may have died meanwhile).
-      await taken.parked;
+      if (!(await taken.parked)) throw new PoolWaitTimeout();
     }
   }
 
@@ -152,7 +161,7 @@ export class ImapPool {
     key: string,
     role: PoolRole,
     requestedAt: number,
-  ): Promise<{ entry: PoolEntry } | { parked: Promise<void> }> {
+  ): Promise<{ entry: PoolEntry } | { parked: Promise<boolean> }> {
     const list = [...(this.entries.get(key) ?? [])];
     for (const entry of list) {
       if (entry.busy) continue;
@@ -166,7 +175,7 @@ export class ImapPool {
       const emailState = this.store.getState(account.id, "email");
       if (idleMs < NOOP_FRESHNESS_MS && entry.emailState === emailState) return { entry };
       try {
-        await entry.client.noop();
+        await withDeadline(entry.client, NOOP_TIMEOUT_MS, "NOOP", () => entry.client.noop());
         entry.emailState = emailState;
         return { entry };
       } catch {
@@ -179,10 +188,10 @@ export class ImapPool {
     // Connections still being opened count against the cap too.
     const opening = this.opening.get(key) ?? 0;
     if ((this.entries.get(key)?.length ?? 0) + opening >= MAX_PER_ROLE[role]) {
-      return { parked: this.waitForRelease(key) };
+      return { parked: this.waitForRelease(key, requestedAt) };
     }
     if (this.dialsPaused(account.id)) {
-      if (this.hasConnections(key)) return { parked: this.waitForRelease(key) };
+      if (this.hasConnections(key)) return { parked: this.waitForRelease(key, requestedAt) };
       // Nobody is left to release a connection: the others parked here learn it too.
       this.wake(key);
       throw new MailServerBusy();
@@ -300,10 +309,24 @@ export class ImapPool {
     };
   }
 
-  private waitForRelease(key: string): Promise<void> {
-    return new Promise<void>((resolve) => {
+  /** True once a connection may be free, false when the request has waited long enough. */
+  private waitForRelease(key: string, requestedAt: number): Promise<boolean> {
+    return new Promise<boolean>((resolve) => {
+      const waiter = (released: boolean) => {
+        clearTimeout(timer);
+        resolve(released);
+      };
+      const timer = setTimeout(() => {
+        const queue = this.waiters.get(key);
+        const i = queue?.indexOf(waiter) ?? -1;
+        if (i < 0) return;
+        queue!.splice(i, 1);
+        if (queue!.length === 0) this.waiters.delete(key);
+        log.warn({ key }, "imap pool: no connection came free in time");
+        waiter(false);
+      }, Math.max(0, requestedAt + poolWaitMs() - Date.now()));
       const queue = this.waiters.get(key) ?? [];
-      queue.push(resolve);
+      queue.push(waiter);
       this.waiters.set(key, queue);
     });
   }
@@ -313,7 +336,7 @@ export class ImapPool {
     if (!queue || queue.length === 0) return;
     const next = queue.shift()!;
     if (queue.length === 0) this.waiters.delete(key);
-    next();
+    next(true);
   }
 
   // Hand a live, already-authenticated connection to the pool. The auth paths
@@ -411,7 +434,7 @@ export class ImapPool {
     }
     this.entries.clear();
     // Nobody is coming back for these; unblock anyone still parked.
-    for (const queue of this.waiters.values()) for (const resolve of queue) resolve();
+    for (const queue of this.waiters.values()) for (const resolve of queue) resolve(true);
     this.waiters.clear();
   }
 }

@@ -4,8 +4,9 @@ import type { ImapPool } from "../../imap/pool.js";
 import { decodeEmailId, decodeMailboxId, encodeBlobId, encodeEmailId, encodeMailboxId } from "../../mapping/ids.js";
 import { encodeEmailState } from "../../state/states.js";
 import { dateMs, fetchEmailsBatch, isoDate, type JmapEmail } from "../../imap/fetcher.js";
-import { isCommandRefusal, MailServerBusy, searchedUids } from "../../imap/busy.js";
-import { throwIfClientGone } from "../abort.js";
+import { gotNoConnection, isCommandRefusal, MailServerBusy, searchedUids } from "../../imap/busy.js";
+import { searchTimeoutMs, withDeadline } from "../../imap/deadline.js";
+import { clientSignal, throwIfClientGone } from "../abort.js";
 import { imapErrorDetails, withMailbox } from "../../imap/client.js";
 import { fetchByUid } from "../../imap/uids.js";
 import { JmapError, accountNotFound, invalidArguments, notFound, unsupportedFilter, unsupportedSort } from "../errors.js";
@@ -36,6 +37,11 @@ interface MailCtx {
   client: ImapFlow;
   store: Store;
   pool?: ImapPool;
+  /**
+   * Gives the request's own connection back while `work` runs on others, and
+   * puts another one in `client` afterwards.
+   */
+  lend?: <T>(work: () => Promise<T>) => Promise<T>;
 }
 
 export interface EmailQueryArgs {
@@ -166,6 +172,7 @@ async function cachedSearch(
   cacheKey: string,
   imapFilter: ReturnType<typeof compileFilter>,
   wasOpen: boolean,
+  text: boolean,
   onSearched?: (uids: number[]) => void,
 ): Promise<number[]> {
   const emailState = store.getState(accountId, "email");
@@ -173,8 +180,17 @@ async function cachedSearch(
   if (cached && cached.modseq === openModseq(client) && cached.emailState === emailState && cached.expiresAt > Date.now()) {
     return cached.uids;
   }
-  if (wasOpen) await client.noop();
-  const searchResult = await client.search(imapFilter, { uid: true });
+  // A full-text search is long enough to be worth a connection to stop.
+  const searchResult = await withDeadline(
+    client,
+    searchTimeoutMs(),
+    "SEARCH",
+    async () => {
+      if (wasOpen) await client.noop();
+      return await client.search(imapFilter, { uid: true });
+    },
+    text ? clientSignal() : undefined,
+  );
   const uids = searchedUids(client, searchResult);
   onSearched?.(uids);
   searchCache.set(cacheKey, {
@@ -358,8 +374,15 @@ export async function emailQuery(
   const lim = Math.min(args.limit ?? 50, 500);
 
   const inMailbox = findInMailbox(filter);
+  const { pool, lend } = ctx;
+  const single = (c: MailCtx) => emailQuerySingleMailboxFull(c, filter, imapFilter, inMailbox!, sort, ascending, needsFetch);
   const full = inMailbox
-    ? await emailQuerySingleMailboxFull(ctx, filter, imapFilter, inMailbox, sort, ascending, needsFetch)
+    ? pool && lend && searchesText(filter)
+      ? await lend(() => oneTextScan(ctx.account.id, () => {
+          throwIfClientGone();
+          return pool.withConnection(ctx.account, "bulk", (client) => single({ ...ctx, client }));
+        }))
+      : await single(ctx)
     : await emailQueryAccountWideFull(ctx, filter, imapFilter, sort, ascending, needsFetch);
 
   let orderedIds = full.ids;
@@ -639,7 +662,7 @@ async function emailQuerySingleMailboxFull(
     );
 
     const cacheKey = searchCacheKey(ctx.account.id, m.mailboxIdx, uidvalidity, filter);
-    const uids = await cachedSearch(ctx.client, ctx.store, ctx.account.id, cacheKey, imapFilter, wasOpen);
+    const uids = await cachedSearch(ctx.client, ctx.store, ctx.account.id, cacheKey, imapFilter, wasOpen, searchesText(filter));
     let orderedUids: number[];
     // Fast path: a pure receivedAt sort (or no sort) is UID order in a single
     // mailbox — SEARCH already returned UIDs ascending, so no FETCH at all.
@@ -809,7 +832,7 @@ async function emailQueryAccountWideFull(
       const cacheKey = searchCacheKey(ctx.account.id, idx, uidvalidity, filter);
       // Only a SEARCH that just ran vouches for the modseq read before it; a
       // searchCache hit may be older than that.
-      const uids = await cachedSearch(client, ctx.store, ctx.account.id, cacheKey, imapFilter, wasOpen, (found) => {
+      const uids = await cachedSearch(client, ctx.store, ctx.account.id, cacheKey, imapFilter, wasOpen, searchesText(filter), (found) => {
         if (liveBefore && liveBefore.uidValidity === uidvalidity) rememberFolderSearch(cacheKey, liveBefore, found);
       });
       if (uids.length === 0) return;
@@ -872,7 +895,8 @@ async function emailQueryAccountWideFull(
       throwIfClientGone();
       return scanFolder(t.idx, t.row, client);
     });
-  const perFolder = await mapWithConcurrency(targets, ACCOUNT_SCAN_CONCURRENCY, async (t) => {
+  const lend = text && ctx.pool ? ctx.lend : undefined;
+  const scanAll = () => mapWithConcurrency(targets, ACCOUNT_SCAN_CONCURRENCY, async (t) => {
     if (failure) return [] as SortableHit[];
     const cached = fromCache(t.idx, t.row);
     if (cached) {
@@ -880,6 +904,8 @@ async function emailQueryAccountWideFull(
       return cached;
     }
     const scan = async (): Promise<SortableHit[]> => {
+      // Another folder may have failed while this one waited its turn.
+      if (failure) return [];
       throwIfClientGone();
       // Unit-test contexts are built without a pool; fall back to the
       // request's own connection, which reproduces the old serial walk.
@@ -887,13 +913,20 @@ async function emailQueryAccountWideFull(
       try {
         return await bulkScan(t);
       } catch (e) {
-        // No bulk connection to be had: walk the folders on this request's own.
-        if (!(e instanceof MailServerBusy)) throw e;
+        // No bulk connection to be had: walk the folders on this request's own,
+        // unless that one was given back or the text search would block it.
+        if (text ? lend || !(e instanceof MailServerBusy) : !gotNoConnection(e)) throw e;
         return await scanFolder(t.idx, t.row, ctx.client);
       }
     };
+    // Noted inside the turn: the next folder's begins as soon as this one ends.
+    const noted = (): Promise<SortableHit[]> =>
+      scan().catch((e) => {
+        if (!isCommandRefusal(e)) failure ??= { error: e };
+        throw e;
+      });
     try {
-      const found = text ? await oneTextScan(ctx.account.id, scan) : await scan();
+      const found = text ? await oneTextScan(ctx.account.id, noted) : await noted();
       answered++;
       return found;
     } catch (e) {
@@ -913,6 +946,9 @@ async function emailQueryAccountWideFull(
       return [] as SortableHit[];
     }
   });
+  // The scan runs on bulk connections; a text search takes too long to hold an
+  // interactive one meanwhile.
+  const perFolder = lend ? await lend(scanAll) : await scanAll();
   if (failure) throw (failure as { error: unknown }).error;
   // Every folder refused: the search is what the server refuses, not a folder.
   if (refused && answered === 0) throw (refused as { error: unknown }).error;

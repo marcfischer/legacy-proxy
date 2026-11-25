@@ -28,7 +28,7 @@ import { runAbortable } from "./jmap/abort.js";
 import { dispatch, isReadOnlyRequest, isRequestEnvelope, NOT_REQUEST_PROBLEM } from "./jmap/router.js";
 import { makeLegacyMethods } from "./backends/legacy.js";
 import { EventSourceHub, type StreamSession } from "./jmap/eventsource.js";
-import { BUSY_RETRY_AFTER_SEC, isTemporaryLoginRefusal, MailServerBusy } from "./imap/busy.js";
+import { BUSY_RETRY_AFTER_SEC, gotNoConnection, isTemporaryLoginRefusal } from "./imap/busy.js";
 import { fetchAfterNoop, imapErrorDetails, isCredentialRefusal, openImap } from "./imap/client.js";
 import { LoginLimiter } from "./auth/loginLimit.js";
 import { StoredPasswordChecks, type CheckAttemptResult } from "./auth/storedCheck.js";
@@ -736,8 +736,8 @@ app.get<{ Params: { accountId: string; blobId: string; type: string; name: strin
     try {
       lease = await pool.acquire(account, "bulk");
     } catch (e) {
-      if (!(e instanceof MailServerBusy)) throw e;
-      return sendLimited(reply, { status: 503, retryAfterSec: BUSY_RETRY_AFTER_SEC, error: e.message });
+      if (!gotNoConnection(e)) throw e;
+      return sendLimited(reply, { status: 503, retryAfterSec: BUSY_RETRY_AFTER_SEC, error: (e as Error).message });
     }
     const client = lease.client;
     const lock = await client.getMailboxLock(mbox.name);

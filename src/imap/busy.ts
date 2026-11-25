@@ -31,6 +31,16 @@ export class MailServerBusy extends JmapError {
   }
 }
 
+/** Every connection of the role stayed in use for as long as a request waits for one. */
+export class PoolWaitTimeout extends JmapError {
+  constructor() {
+    super("serverUnavailable", "all connections to the mail server are in use");
+  }
+}
+
+/** True when a request got no connection, for either reason. */
+export const gotNoConnection = (e: unknown): boolean => e instanceof MailServerBusy || e instanceof PoolWaitTimeout;
+
 /**
  * The UIDs a UID SEARCH found. imapflow answers `false` when the command
  * failed, which must not pass for a folder without matches.

@@ -228,10 +228,27 @@ function makeMethodTable(): Record<string, Handler> {
       c.pool.withConnection(c.account, "interactive", (client) =>
         mailboxSet(a as never, { account: c.account, client, store: c.store }),
       ),
-    "Email/query": async (a, c) =>
-      c.pool.withConnection(c.account, "interactive", (client) =>
-        emailQuery(a as never, { account: c.account, client, store: c.store, pool: c.pool }),
-      ),
+    "Email/query": async (a, c) => {
+      let lease = await c.pool.acquire(c.account, "interactive");
+      const ctx = {
+        account: c.account,
+        client: lease.client,
+        store: c.store,
+        pool: c.pool,
+        lend: async <T>(work: () => Promise<T>): Promise<T> => {
+          lease.release();
+          const result = await work();
+          lease = await c.pool.acquire(c.account, "interactive");
+          ctx.client = lease.client;
+          return result;
+        },
+      };
+      try {
+        return await emailQuery(a as never, ctx);
+      } finally {
+        lease.release();
+      }
+    },
     "Email/get": async (a, c) =>
       c.pool.withConnection(c.account, "interactive", (client) =>
         emailGet(a as never, { account: c.account, client, store: c.store, pool: c.pool }),
