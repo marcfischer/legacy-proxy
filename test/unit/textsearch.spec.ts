@@ -7,7 +7,8 @@ import { matchesText, resetTextSearch, searchText, splitTextFilter, TextSearchSt
 
 process.env.LOG_LEVEL = "silent";
 process.env.IMAP_TEXT_STEP_TIMEOUT_MS = "150";
-afterAll(() => { delete process.env.IMAP_TEXT_STEP_TIMEOUT_MS; });
+process.env.IMAP_TEXT_READ_MAX = "10";
+afterAll(() => { delete process.env.IMAP_TEXT_STEP_TIMEOUT_MS; delete process.env.IMAP_TEXT_READ_MAX; });
 beforeEach(() => resetTextSearch());
 
 const expand = (set: string) =>
@@ -126,4 +127,19 @@ it("matches text in subject, addresses and body, and body in the body alone", ()
   expect(matchesText([{ body: '"nachweis ist"' }], m)).toBe(true);
   expect(matchesText([{ body: '"ist nachweis"' }], m)).toBe(false);
   expect(matchesText([{ text: "müller" }, { body: "da" }], m)).toBe(true);
+});
+
+it("reads a few messages without asking the server for their text", async () => {
+  const reads: number[][] = [];
+  const c = silentServer(10);
+  expect(await run(c, { text: "word" }, { read: reader(reads) })).toEqual([10]);
+  expect(c.closed).toBe(false);
+  expect(reads.flat()).toHaveLength(10);
+});
+
+it("stops asking for an account that left two folders unanswered, but not for another", async () => {
+  const read = reader([]);
+  for (const folderKey of ["1|a", "1|b"]) await expect(run(silentServer(50), { text: "word" }, { read, folderKey })).rejects.toBeInstanceOf(TextSearchStalled);
+  expect(await run(silentServer(50), { text: "word" }, { read, folderKey: "1|c" })).toHaveLength(5);
+  await expect(run(silentServer(50), { text: "word" }, { read, folderKey: "2|a" })).rejects.toBeInstanceOf(TextSearchStalled);
 });

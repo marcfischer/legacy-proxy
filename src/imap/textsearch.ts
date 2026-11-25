@@ -79,9 +79,26 @@ export class TextSearchStalled extends JmapError {
   }
 }
 
+// Up to this many messages are read and searched here without asking the
+// server: that takes a moment, and an unanswered search seconds and a connection.
+const readMax = (): number => Number(process.env.IMAP_TEXT_READ_MAX ?? 200);
+// After this many unanswered folders of an account the server is asked only
+// where reading takes far longer than another try.
+const STALLS_PER_ACCOUNT = 2;
+const TOO_MANY_TO_READ = 5_000;
+
 // Folders whose text the server did not search, and until when not to ask it.
 const stalled = new Map<string, number>();
 const STALLED_MS = 5 * 60_000;
+
+function isStalled(folderKey: string, messages: number): boolean {
+  const now = Date.now();
+  for (const [key, until] of stalled) if (until <= now) stalled.delete(key);
+  if (stalled.has(folderKey)) return true;
+  const account = folderKey.slice(0, folderKey.indexOf("|") + 1);
+  const others = account ? [...stalled.keys()].filter((key) => key.startsWith(account)).length : 0;
+  return others >= STALLS_PER_ACCOUNT && messages <= TOO_MANY_TO_READ;
+}
 
 /** What a message offers a search, decoded. */
 export interface MessageText {
@@ -139,7 +156,7 @@ export async function searchText(client: ImapFlow, s: TextSearch): Promise<numbe
   // An empty text matches everything, and needs nothing read.
   const todo = Object.keys(text).length === 0 ? [] : candidates.filter((uid) => !k.searched.has(uid)).sort((a, b) => b - a);
   const before = candidates.length - todo.length;
-  const reading = s.read !== undefined && (stalled.get(s.folderKey) ?? 0) > Date.now();
+  const reading = s.read !== undefined && (todo.length <= readMax() || isStalled(s.folderKey, todo.length));
   let done = 0;
 
   const askServer = async (uids: number[]): Promise<void> => {

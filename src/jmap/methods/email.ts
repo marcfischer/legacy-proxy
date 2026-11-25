@@ -855,7 +855,7 @@ async function emailQueryAccountWideFull(
   // Each folder's hits are collected separately and concatenated in
   // listMailboxes order, so the merge below sees exactly the input it saw
   // when this ran serially. The result is identical, only sooner.
-  const targets: Array<{ idx: number; row: MboxRow }> = [];
+  const targets: Array<{ idx: number; row: MboxRow; messages: number }> = [];
   for (const m of all) {
     const idx = decodeMailboxId(m.id).mailboxIdx;
     if (excludedIdxs.has(idx)) continue;
@@ -865,8 +865,10 @@ async function emailQueryAccountWideFull(
     if (m.totalEmails === 0) continue;
     const row = rowById.get(idx);
     if (!row) continue;
-    targets.push({ idx, row });
+    targets.push({ idx, row, messages: m.totalEmails });
   }
+  // Small folders first: a text search that runs out of time has then done most of them.
+  if (textUntil !== null) targets.sort((a, b) => a.messages - b.messages);
 
   // A folder whose HIGHESTMODSEQ hasn't moved since its last search, with
   // every hit's date in the SQLite cache, is answered without a connection.

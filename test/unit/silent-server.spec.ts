@@ -27,6 +27,7 @@ beforeAll(async () => {
   process.env.IMAP_TEXT_SEARCH_TIMEOUT_MS = "1500";
   process.env.IMAP_POOL_WAIT_MS = "1000";
   process.env.IMAP_TEXT_STEP_TIMEOUT_MS = "200";
+  process.env.IMAP_TEXT_READ_MAX = "0";
   server = net.createServer((sock) => {
     let waiting = false;
     sock.on("error", () => {});
@@ -73,6 +74,7 @@ afterAll(async () => {
   delete process.env.IMAP_TEXT_SEARCH_TIMEOUT_MS;
   delete process.env.IMAP_POOL_WAIT_MS;
   delete process.env.IMAP_TEXT_STEP_TIMEOUT_MS;
+  delete process.env.IMAP_TEXT_READ_MAX;
   await app.close();
   server.close();
   fs.rmSync(dir, { recursive: true, force: true });
@@ -125,6 +127,16 @@ it("finds the messages by reading them when the server never searches their text
   expect((await call("Email/query", { filter: { text: "betreff" }, calculateTotal: true })).call[1].total).toBe(4);
   readable = false;
 }, 30_000);
+
+it("finds them at once in small folders, without a text search", async () => {
+  readable = true;
+  process.env.IMAP_TEXT_READ_MAX = "200";
+  const r = await call("Email/query", { filter: { text: "rechnung" }, calculateTotal: true });
+  expect(r.call[1].total).toBe(4);
+  expect(silent.total).toBe(0);
+  process.env.IMAP_TEXT_READ_MAX = "0";
+  readable = false;
+});
 
 it("works again, with every hit, once the server answers", async () => {
   answerText = true;

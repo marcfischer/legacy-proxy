@@ -2,7 +2,7 @@
 // connection at a time, stops when its client has gone, and a SEARCH that
 // failed never passes for an empty folder.
 
-import { afterEach, beforeEach, expect, it } from "vitest";
+import { afterAll, afterEach, beforeEach, expect, it } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -15,6 +15,9 @@ import { buildThreadIndex } from "../../src/jmap/methods/threads.js";
 import { listMailboxes, resetMailboxListCache } from "../../src/jmap/methods/mailbox.js";
 
 process.env.LOG_LEVEL = "silent";
+// The searches the server answers; its messages cannot be read here.
+process.env.IMAP_TEXT_READ_MAX = "0";
+afterAll(() => { delete process.env.IMAP_TEXT_READ_MAX; });
 
 let dir: string;
 let store: Store;
