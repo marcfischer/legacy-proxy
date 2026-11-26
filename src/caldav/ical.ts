@@ -360,24 +360,64 @@ function participantLine(name: "ORGANIZER" | "ATTENDEE", addr: string, p: Record
   return `${name}${params.map(([k, v, wire]) => `;${k}=${wire ? v : quoteParam(v)}`).join("")}:mailto:${addr}`;
 }
 
+/** A VEVENT's VALARMs that have a TRIGGER; alert "aN" is the Nth of them. */
+function triggeredAlarms(v: Component | undefined): Component[] {
+  return (v?.children ?? []).filter((a) => a.type === "VALARM" && prop(a, "TRIGGER"));
+}
+
 function alerts(v: Component): Record<string, unknown> | null {
   const out: Record<string, unknown> = {};
   let n = 0;
-  for (const a of v.children) {
-    const t = a.type === "VALARM" ? prop(a, "TRIGGER") : undefined;
-    if (!t) continue;
+  for (const a of triggeredAlarms(v)) {
+    const t = prop(a, "TRIGGER")!;
     const abs = t.params.VALUE?.[0]?.toUpperCase() === "DATE-TIME";
     out[`a${++n}`] = {
       "@type": "Alert",
       trigger: abs
         ? { "@type": "AbsoluteTrigger", when: utcStamp(t) }
         : { "@type": "OffsetTrigger", offset: t.value, relativeTo: t.params.RELATED?.[0]?.toUpperCase() === "END" ? "end" : "start" },
+      // AUDIO and other actions read as display; the stored VALARM keeps its own when written back.
       action: prop(a, "ACTION")?.value.toUpperCase() === "EMAIL" ? "email" : "display",
-      acknowledged: null,
+      // RFC 9074 §6
+      acknowledged: utcStamp(prop(a, "ACKNOWLEDGED")),
       relatedTo: null,
     };
   }
   return n ? out : null;
+}
+
+// What alarmLines writes itself on a stored VALARM; the rest of it is kept.
+const MANAGED_ALARM = new Set(["TRIGGER", "ACKNOWLEDGED"]);
+
+/**
+ * One alert as a VALARM. An alert read from a stored VALARM ("aN") is written
+ * over that VALARM: its ACTION, DESCRIPTION, ATTENDEE, ATTACH, REPEAT, UID and
+ * X- lines stay, so an AUDIO or EMAIL alarm stays one. A new alert, or one
+ * switched between email and display, is a DISPLAY alarm: EMAIL alarms need
+ * ATTENDEE and SUMMARY lines of their own (RFC 5545 §3.6.6).
+ */
+function alarmLines(id: string, a: Record<string, unknown>, title: unknown, stored: Component[]): string[] {
+  const t = a.trigger as Record<string, string> | undefined;
+  if (!t) return [];
+  const trigger = t["@type"] === "AbsoluteTrigger" && t.when
+    ? `TRIGGER;VALUE=DATE-TIME:${compactUtc(Date.parse(t.when))}`
+    : `TRIGGER${t.relativeTo === "end" ? ";RELATED=END" : ""}:${t.offset ?? "PT0S"}`;
+  const ackMs = typeof a.acknowledged === "string" ? Date.parse(a.acknowledged) : NaN;
+  const ack = Number.isFinite(ackMs) ? [`ACKNOWLEDGED:${compactUtc(ackMs)}`] : [];
+  const n = /^a([1-9]\d{0,5})$/.exec(id);
+  const orig = n ? stored[Number(n[1]) - 1] : undefined;
+  const origEmail = orig ? prop(orig, "ACTION")?.value.toUpperCase() === "EMAIL" : false;
+  if (orig && origEmail === (a.action === "email")) {
+    return [
+      "BEGIN:VALARM",
+      ...orig.props.filter((p) => !MANAGED_ALARM.has(p.name)).map(rawLine),
+      trigger,
+      ...ack,
+      ...orig.children.flatMap(rawComponent),
+      "END:VALARM",
+    ];
+  }
+  return ["BEGIN:VALARM", "ACTION:DISPLAY", `DESCRIPTION:${escapeValue(String(title || "Reminder"))}`, trigger, ...ack, "END:VALARM"];
 }
 
 // -- RRULE ---------------------------------------------------------------------
@@ -551,6 +591,28 @@ const MANAGED = new Set([
   "SEQUENCE", "ORGANIZER", "ATTENDEE", "CONFERENCE", "CATEGORIES",
 ]);
 
+// Other versions of DESCRIPTION (HTML from Outlook and Exchange, RFC 9073
+// styled text). Kept while the description is unchanged; once it changes
+// they are stale, and other clients would go on showing the old text.
+const DESCRIPTION_VERSIONS = new Set(["X-ALT-DESC", "STYLED-DESCRIPTION"]);
+
+/** The stored VEVENT's lines eventToIcal doesn't write itself, for `e` written over it. */
+function keptLines(c: Component, e: JsEvent): string[] {
+  const descChanged = sameText(c, "DESCRIPTION", e.description) === null;
+  return c.props.filter((p) => !MANAGED.has(p.name) && !(descChanged && DESCRIPTION_VERSIONS.has(p.name))).map(rawLine);
+}
+
+/**
+ * The stored line for a text property when `value` is still what it says,
+ * so its LANGUAGE and ALTREP stay; null when it changed or there is none.
+ */
+function sameText(c: Component | undefined, name: string, value: unknown): string | null {
+  const p = c && prop(c, name);
+  if (!p) return value ? null : "";
+  const norm = (s: string) => s.replace(/\r\n?/g, "\n");
+  return norm(unescapeValue(p.value)) === norm(String(value ?? "")) ? rawLine(p) : null;
+}
+
 /**
  * Serialise a JSCalendar Event as a CalDAV resource. `original` is the stored
  * iCalendar body on update: its VTIMEZONEs and unmodelled master properties
@@ -566,6 +628,9 @@ export function eventToIcal(ev: JsEvent, original?: string, opts: { keepSequence
   // §3.2.19), an occurrence moved to another zone included.
   // From the parsed tree, line by line: a regex over the raw text takes
   // quadratic time on a body full of unclosed VTIMEZONEs.
+  const origCalendar = original ? parseComponents(original).find((c) => c.type === "VCALENDAR") : undefined;
+  // The calendar's own X- lines (X-WR-CALNAME, X-MICROSOFT-CDO-..., ...).
+  for (const p of origCalendar?.props ?? []) if (p.name.startsWith("X-")) lines.push(rawLine(p));
   const keptZones = original ? parseComponents(original).flatMap((c) => c.children).filter((c) => c.type === "VTIMEZONE") : [];
   for (const z of keptZones) lines.push(...rawComponent(z));
   const year = Number(String(ev.start ?? "").slice(0, 4)) || new Date().getUTCFullYear();
@@ -593,7 +658,7 @@ export function eventToIcal(ev: JsEvent, original?: string, opts: { keepSequence
   const masterOrig = instance === null
     ? origVevents.find((c) => !prop(c, "RECURRENCE-ID"))
     : origVevents.find((c) => ridOf(c) === instance) ?? origVevents[0];
-  const extra = masterOrig ? masterOrig.props.filter((p) => !MANAGED.has(p.name)).map(rawLine) : [];
+  const extra = masterOrig ? keptLines(masterOrig, ev) : [];
 
   const exdates = Object.entries(overrides).filter(([, o]) => o.excluded).map(([k]) => dateLine("EXDATE", k, tz, allDay));
   // An added occurrence comes back as an override with an empty patch; one the
@@ -607,7 +672,7 @@ export function eventToIcal(ev: JsEvent, original?: string, opts: { keepSequence
   const origParts = participantLines(masterOrig);
   const rule = ev.recurrenceRule ? [`RRULE:${rruleString(ev.recurrenceRule as Record<string, unknown>, tz, allDay)}`] : [];
   const instanceLine = instance === null ? undefined : dateLine("RECURRENCE-ID", instance, instanceTz, allDay);
-  lines.push(...vevent(ev, tz, allDay, [...rule, ...rdates, ...exdates, ...extra], instanceLine, origParts));
+  lines.push(...vevent(ev, tz, allDay, [...rule, ...rdates, ...exdates, ...extra], instanceLine, origParts, masterOrig));
   if (instance !== null) {
     for (const c of origVevents) if (c !== masterOrig && prop(c, "RECURRENCE-ID")) lines.push(...rawComponent(c));
   }
@@ -629,9 +694,11 @@ export function eventToIcal(ev: JsEvent, original?: string, opts: { keepSequence
     // A reply leaves every VEVENT at the SEQUENCE it had: it is the organizer's.
     const ownSeq = own && prop(own, "SEQUENCE");
     if (opts.keepSequence && ownSeq) o.sequence = Number(ownSeq.value) || 0;
-    const ownExtra = own ? own.props.filter((p) => !MANAGED.has(p.name)).map(rawLine) : [];
+    const ownExtra = own ? keptLines(own, o) : [];
     const ownParts = own ? new Map([...origParts, ...participantLines(own)]) : origParts;
-    lines.push(...vevent(o, oTz, o.showWithoutTime === true, ownExtra, dateLine("RECURRENCE-ID", key, tz, allDay), ownParts));
+    // Alerts the occurrence doesn't change are the series', and so are their VALARMs.
+    const alarmSource = own && "alerts" in patch ? own : masterOrig;
+    lines.push(...vevent(o, oTz, o.showWithoutTime === true, ownExtra, dateLine("RECURRENCE-ID", key, tz, allDay), ownParts, own, alarmSource));
   }
   lines.push("END:VCALENDAR");
   // Each entry is one content line. A line break in a value that skipped
@@ -646,6 +713,8 @@ function vevent(
   extra: string[],
   recurrenceId?: string,
   originalParticipants?: Map<string, ParsedLine>,
+  stored?: Component,
+  alarmSource: Component | undefined = stored,
 ): string[] {
   const start = String(e.start ?? "");
   // UID is TEXT (RFC 5545 §3.8.4.7) and read back unescaped, so it is written escaped.
@@ -653,10 +722,15 @@ function vevent(
   if (recurrenceId) out.push(recurrenceId);
   out.push(dateLine("DTSTART", start, tz, allDay));
   out.push(dateLine("DTEND", addSeconds(start, durationSeconds(String(e.duration ?? (allDay ? "P1D" : "PT0S"))), tz, allDay), tz, allDay));
-  if (e.title) out.push(`SUMMARY:${escapeValue(String(e.title))}`);
-  if (e.description) out.push(`DESCRIPTION:${escapeValue(String(e.description))}`);
-  const loc = Object.values((e.locations ?? {}) as Record<string, { name?: string }>).find((l) => l?.name)?.name;
-  if (loc) out.push(`LOCATION:${escapeValue(loc)}`);
+  // A text the event still has is written as stored, with its LANGUAGE and ALTREP.
+  const textLine = (name: string, value: unknown) => {
+    const same = sameText(stored, name, value);
+    if (same) out.push(same);
+    else if (same === null && value) out.push(`${name}:${escapeValue(String(value))}`);
+  };
+  textLine("SUMMARY", e.title);
+  textLine("DESCRIPTION", e.description);
+  textLine("LOCATION", Object.values((e.locations ?? {}) as Record<string, { name?: string }>).find((l) => l?.name)?.name);
   out.push(...conferenceLines(e), ...categoriesLine(e));
   if (typeof e.status === "string") out.push(`STATUS:${e.status.toUpperCase()}`);
   out.push(`TRANSP:${e.freeBusyStatus === "free" ? "TRANSPARENT" : "OPAQUE"}`);
@@ -678,16 +752,12 @@ function vevent(
     }
   }
 
-  for (const a of Object.values((e.alerts ?? {}) as Record<string, { trigger?: Record<string, string> }>)) {
-    const t = a?.trigger;
-    if (!t) continue;
-    const trigger = t["@type"] === "AbsoluteTrigger" && t.when
-      ? `TRIGGER;VALUE=DATE-TIME:${compactUtc(Date.parse(t.when))}`
-      : `TRIGGER${t.relativeTo === "end" ? ";RELATED=END" : ""}:${t.offset ?? "PT0S"}`;
-    // EMAIL alarms need ATTENDEE / SUMMARY lines of their own (RFC 5545
-    // §3.6.6), so every alert is written as a DISPLAY alarm.
-    out.push("BEGIN:VALARM", "ACTION:DISPLAY", `DESCRIPTION:${escapeValue(String(e.title || "Reminder"))}`, trigger, "END:VALARM");
+  const storedAlarms = triggeredAlarms(alarmSource);
+  for (const [id, a] of Object.entries((e.alerts ?? {}) as Record<string, Record<string, unknown> | null>)) {
+    if (a) out.push(...alarmLines(id, a, e.title, storedAlarms));
   }
+  // Components the mapping doesn't model (RFC 9073 VLOCATION, PARTICIPANT) stay.
+  for (const c of stored?.children ?? []) if (c.type !== "VALARM") out.push(...rawComponent(c));
   out.push("END:VEVENT");
   return out;
 }
